@@ -1,0 +1,14 @@
+/TriDecomp
+/tools/make_test_shp
+/testdata/
+*.o
+*.exe
+polygon_output.h
+polygon_output.txt
+pipeline_log.txt
+ags_transactions.txt
+ags_transactions_quantized.txt
+quantization_report.txt
+triangle_decision_log.txt
+debug_out_lookahead.txt
+*.csv
