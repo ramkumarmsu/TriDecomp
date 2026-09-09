@@ -69,6 +69,8 @@
 //   --legacy-lookahead   Use the legacy recursive lookahead engine instead
 //   --lookahead <N>      Lookahead depth for the legacy engine (default: 0)
 //   --no-quantize        Skip fixed-point quantization / walkable publishing
+//   --quiet              Progress + AGS records + CSVs; skip per-iteration debug
+//   --verbose            Dump every cell's vertices/edges to debug_out_lookahead.txt
 //   --reduce <pct>       Reduction % (alternative to positional)
 //   --header <path>      Output CGAL header file (default: polygon_output.h)
 //   --points <path>      Output points file (default: polygon_output.txt)
@@ -188,6 +190,21 @@ bool USE_ANGLE_METHOD = true;
 //   Disable with --no-quantize.
 // =========================================================================
 bool QUANTIZE_TRANSACTIONS = true;
+
+// =========================================================================
+// LOG VERBOSITY
+//   0 = --quiet   : stderr progress + AGS records + CSVs; skip per-iteration debug
+//   1 = default   : full log files, buffered (no per-iteration flush)
+//   2 = --verbose : also dump every cell's vertices/edges to debug_out_lookahead.txt
+// =========================================================================
+int G_VERBOSITY = 1;
+static inline bool log_decisions() { return G_VERBOSITY >= 1; }
+static inline bool verbose_debug() { return G_VERBOSITY >= 2; }
+static inline int progress_interval() {
+    if (G_VERBOSITY <= 0) return 500;
+    if (G_VERBOSITY == 1) return 100;
+    return 10;
+}
 
 // =========================================================================
 // SHAPEFILE READING (shapelib) with state FIPS filter
@@ -838,7 +855,6 @@ void compute_dynamic_limits(int num_segments) {
 const bool ENABLE_EARLY_TERMINATION = true;
 const long long LOG_FLUSH_INTERVAL = 1000;
 const long long MAX_RECURSIVE_CALLS_PER_EVAL = 1000000;
-const int MAIN_LOOP_PROGRESS_INTERVAL = 10;
 
 static bool g_evaluation_terminated = false;
 
@@ -1096,8 +1112,123 @@ static double compute_balance_score(const std::array<Triangle, 2>& child_tris,
 }
 
 // =========================================================================
-// Modified assign_edges_to_children with LINE SPLIT TRACKING
+// Assign remaining polygon edges to the two children of a split.
+//
+// Fast path: if both endpoints lie strictly on the same side of the cut's
+// supporting line, the edge cannot meet the split *segment*, so skip the
+// exact intersection and classify by Triangle_cgal::bounded_side (same
+// predicate compute_balance_score already uses).
+//
+// Slow path: an endpoint on the line, or endpoints on opposite sides, may
+// meet the cut. Then CGAL::intersection produces the exact split point so
+// LINE_SPLIT records stay exact-kernel.
 // =========================================================================
+static void place_edge_in_child(const Edge& seg, const Triangle_cgal ct[2],
+                                std::vector<Edge> child_edges[2])
+{
+    if (point_eq(seg.source(), seg.target())) return;
+    Point mid = CGAL::midpoint(seg.source(), seg.target());
+    for (int i = 0; i < 2; ++i) {
+        auto side = ct[i].bounded_side(mid);
+        if (side == CGAL::ON_BOUNDED_SIDE || side == CGAL::ON_BOUNDARY) {
+            child_edges[i].push_back(seg);
+            return;
+        }
+    }
+}
+
+static bool edge_may_meet_cut(const Line& cut_line, const Edge& edge)
+{
+    auto sa = cut_line.oriented_side(edge.source());
+    auto sb = cut_line.oriented_side(edge.target());
+    if (sa == CGAL::ON_ORIENTED_BOUNDARY || sb == CGAL::ON_ORIENTED_BOUNDARY)
+        return true;
+    return (sa == CGAL::ON_POSITIVE_SIDE && sb == CGAL::ON_NEGATIVE_SIDE) ||
+           (sa == CGAL::ON_NEGATIVE_SIDE && sb == CGAL::ON_POSITIVE_SIDE);
+}
+
+static void record_line_split_if_needed(
+    bool track, const Edge& edge, const Point& p,
+    const Edge& seg1, const Edge& seg2,
+    bool seg1_valid, bool seg2_valid,
+    int triangle_split_id, int iteration,
+    std::vector<LineSplitRecord>* line_splits_out)
+{
+    if (!track) return;
+    if (seg1_valid && seg2_valid) {
+        g_line_split_count++;
+        LineSplitRecord record;
+        record.split_id = g_line_split_count;
+        record.original_edge = edge;
+        record.split_point = p;
+        record.segment1 = seg1;
+        record.segment2 = seg2;
+        record.triangle_split_id = triangle_split_id;
+        record.iteration = iteration;
+        line_splits_out->push_back(record);
+        g_line_splits.push_back(record);
+
+        g_transaction_log << "LINE_SPLIT #" << record.split_id
+                         << " (caused by TRIANGLE_SPLIT #" << triangle_split_id << ")\n";
+        g_transaction_log << "  Original edge: " << edge_to_string(edge) << "\n";
+        g_transaction_log << "  Split point: " << point_to_string(p) << "\n";
+        g_transaction_log << "  Segment 1: " << edge_to_string(seg1) << "\n";
+        g_transaction_log << "  Segment 2: " << edge_to_string(seg2) << "\n";
+        g_transaction_log << "  Iteration: " << iteration << "\n\n";
+    } else if (verbose_debug() && (seg1_valid || seg2_valid)) {
+        g_transaction_log << "VERTEX_THROUGH (TRIANGLE_SPLIT #" << triangle_split_id << ")\n";
+        g_transaction_log << "  Edge: " << edge_to_string(edge) << "\n";
+        g_transaction_log << "  Vertex hit: " << point_to_string(p) << "\n";
+        g_transaction_log << "  No LINE_SPLIT recorded (existing vertex, no new boundary point)\n";
+        g_transaction_log << "  Iteration: " << iteration << "\n\n";
+    }
+}
+
+static std::pair<std::vector<Edge>, std::vector<Edge>> assign_edges_impl(
+    const std::array<Triangle, 2>& child_tris,
+    const std::vector<Edge>& edges,
+    const Edge& split_line,
+    bool track,
+    int triangle_split_id,
+    int iteration,
+    std::vector<LineSplitRecord>* line_splits_out)
+{
+    std::vector<Edge> child_edges[2];
+    Triangle_cgal ct[2] = {
+        Triangle_cgal(child_tris[0][0], child_tris[0][1], child_tris[0][2]),
+        Triangle_cgal(child_tris[1][0], child_tris[1][1], child_tris[1][2])
+    };
+    Line cut_line = split_line.supporting_line();
+
+    for (const auto& edge : edges) {
+        if (!edge_may_meet_cut(cut_line, edge)) {
+            place_edge_in_child(edge, ct, child_edges);
+            continue;
+        }
+
+        auto intersection_result = CGAL::intersection(edge, split_line);
+        if (!intersection_result) {
+            place_edge_in_child(edge, ct, child_edges);
+            continue;
+        }
+        const CGAL::Object& intersection_obj = *intersection_result;
+        if (const Point* p = CGAL::object_cast<Point>(&intersection_obj)) {
+            Edge seg1(edge.source(), *p);
+            Edge seg2(*p, edge.target());
+            bool seg1_valid = !point_eq(seg1.source(), seg1.target());
+            bool seg2_valid = !point_eq(seg2.source(), seg2.target());
+            record_line_split_if_needed(track, edge, *p, seg1, seg2,
+                                        seg1_valid, seg2_valid,
+                                        triangle_split_id, iteration, line_splits_out);
+            if (seg1_valid) place_edge_in_child(seg1, ct, child_edges);
+            if (seg2_valid) place_edge_in_child(seg2, ct, child_edges);
+        } else if (CGAL::object_cast<Edge>(&intersection_obj)) {
+            place_edge_in_child(edge, ct, child_edges);
+        }
+    }
+    return { child_edges[0], child_edges[1] };
+}
+
 std::pair<std::vector<Edge>, std::vector<Edge>> assign_edges_to_children_tracked(
     const std::array<Triangle, 2>& child_tris,
     const std::vector<Edge>& edges,
@@ -1106,166 +1237,16 @@ std::pair<std::vector<Edge>, std::vector<Edge>> assign_edges_to_children_tracked
     int iteration,
     std::vector<LineSplitRecord>& line_splits_out)
 {
-    std::vector<Edge> child_edges[2];
-    Polygon child_polys[2];
-    for (int i = 0; i < 2; ++i) {
-        child_polys[i].push_back(child_tris[i][0]);
-        child_polys[i].push_back(child_tris[i][1]);
-        child_polys[i].push_back(child_tris[i][2]);
-    }
-
-    for (const auto& edge : edges) {
-        auto intersection_result = CGAL::intersection(edge, split_line);
-        if (!intersection_result) {
-            // No intersection - assign to appropriate child
-            Point mid = CGAL::midpoint(edge.source(), edge.target());
-            for (int i = 0; i < 2; ++i) {
-                if (child_polys[i].bounded_side(mid) != CGAL::ON_UNBOUNDED_SIDE) {
-                    child_edges[i].push_back(edge);
-                    break;
-                }
-            }
-        }
-        else {
-            const CGAL::Object& intersection_obj = *intersection_result;
-            if (const Point* p = CGAL::object_cast<Point>(&intersection_obj)) {
-                Edge seg1(edge.source(), *p);
-                Edge seg2(*p, edge.target());
-                
-                bool seg1_valid = !point_eq(seg1.source(), seg1.target());
-                bool seg2_valid = !point_eq(seg2.source(), seg2.target());
-
-                // Record LINE_SPLIT only when the split line truly bisects a polygon edge
-                // (both resulting segments are non-degenerate). Endpoint splits where the
-                // split line passes through an existing polygon vertex do NOT count as
-                // LINE_SPLITs — no new boundary point is introduced.
-                if (seg1_valid && seg2_valid) {
-                    g_line_split_count++;
-                    LineSplitRecord record;
-                    record.split_id = g_line_split_count;
-                    record.original_edge = edge;
-                    record.split_point = *p;
-                    record.segment1 = seg1;
-                    record.segment2 = seg2;
-                    record.triangle_split_id = triangle_split_id;
-                    record.iteration = iteration;
-                    line_splits_out.push_back(record);
-                    g_line_splits.push_back(record);
-
-                    g_transaction_log << "LINE_SPLIT #" << record.split_id
-                                     << " (caused by TRIANGLE_SPLIT #" << triangle_split_id << ")\n";
-                    g_transaction_log << "  Original edge: " << edge_to_string(edge) << "\n";
-                    g_transaction_log << "  Split point: " << point_to_string(*p) << "\n";
-                    g_transaction_log << "  Segment 1: " << edge_to_string(seg1) << "\n";
-                    g_transaction_log << "  Segment 2: " << edge_to_string(seg2) << "\n";
-                    g_transaction_log << "  Iteration: " << iteration << "\n\n";
-                } else if (seg1_valid || seg2_valid) {
-                    // Endpoint case: split line passes through an existing polygon vertex.
-                    // The edge is NOT actually split — the surviving segment equals the
-                    // original edge. Log for traceability but do NOT count as a transaction.
-                    g_transaction_log << "VERTEX_THROUGH (TRIANGLE_SPLIT #" << triangle_split_id << ")\n";
-                    g_transaction_log << "  Edge: " << edge_to_string(edge) << "\n";
-                    g_transaction_log << "  Vertex hit: " << point_to_string(*p) << "\n";
-                    g_transaction_log << "  No LINE_SPLIT recorded (existing vertex, no new boundary point)\n";
-                    g_transaction_log << "  Iteration: " << iteration << "\n\n";
-                }
-
-                if (seg1_valid) {
-                    Point mid1 = CGAL::midpoint(seg1.source(), seg1.target());
-                    for (int i = 0; i < 2; ++i) {
-                        if (child_polys[i].bounded_side(mid1) != CGAL::ON_UNBOUNDED_SIDE) {
-                            child_edges[i].push_back(seg1);
-                            break;
-                        }
-                    }
-                }
-                if (seg2_valid) {
-                    Point mid2 = CGAL::midpoint(seg2.source(), seg2.target());
-                    for (int i = 0; i < 2; ++i) {
-                        if (child_polys[i].bounded_side(mid2) != CGAL::ON_UNBOUNDED_SIDE) {
-                            child_edges[i].push_back(seg2);
-                            break;
-                        }
-                    }
-                }
-            }
-            else if (const Edge* s = CGAL::object_cast<Edge>(&intersection_obj)) {
-                // Collinear overlap - no split, just assign
-                Point mid = CGAL::midpoint(edge.source(), edge.target());
-                for (int i = 0; i < 2; ++i) {
-                    if (child_polys[i].bounded_side(mid) != CGAL::ON_UNBOUNDED_SIDE) {
-                        child_edges[i].push_back(edge);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    return { child_edges[0], child_edges[1] };
+    return assign_edges_impl(child_tris, edges, split_line, true,
+                             triangle_split_id, iteration, &line_splits_out);
 }
 
-// Original version without tracking (for recursive evaluation)
 std::pair<std::vector<Edge>, std::vector<Edge>> assign_edges_to_children(
     const std::array<Triangle, 2>& child_tris,
     const std::vector<Edge>& edges,
     const Edge& split_line)
 {
-    std::vector<Edge> child_edges[2];
-    Polygon child_polys[2];
-    for (int i = 0; i < 2; ++i) {
-        child_polys[i].push_back(child_tris[i][0]);
-        child_polys[i].push_back(child_tris[i][1]);
-        child_polys[i].push_back(child_tris[i][2]);
-    }
-
-    for (const auto& edge : edges) {
-        auto intersection_result = CGAL::intersection(edge, split_line);
-        if (!intersection_result) {
-            Point mid = CGAL::midpoint(edge.source(), edge.target());
-            for (int i = 0; i < 2; ++i) {
-                if (child_polys[i].bounded_side(mid) != CGAL::ON_UNBOUNDED_SIDE) {
-                    child_edges[i].push_back(edge);
-                    break;
-                }
-            }
-        }
-        else {
-            const CGAL::Object& intersection_obj = *intersection_result;
-            if (const Point* p = CGAL::object_cast<Point>(&intersection_obj)) {
-                Edge seg1(edge.source(), *p);
-                Edge seg2(*p, edge.target());
-
-                if (!point_eq(seg1.source(), seg1.target())) {
-                    Point mid1 = CGAL::midpoint(seg1.source(), seg1.target());
-                    for (int i = 0; i < 2; ++i) {
-                        if (child_polys[i].bounded_side(mid1) != CGAL::ON_UNBOUNDED_SIDE) {
-                            child_edges[i].push_back(seg1);
-                            break;
-                        }
-                    }
-                }
-                if (!point_eq(seg2.source(), seg2.target())) {
-                    Point mid2 = CGAL::midpoint(seg2.source(), seg2.target());
-                    for (int i = 0; i < 2; ++i) {
-                        if (child_polys[i].bounded_side(mid2) != CGAL::ON_UNBOUNDED_SIDE) {
-                            child_edges[i].push_back(seg2);
-                            break;
-                        }
-                    }
-                }
-            }
-            else if (const Edge* s = CGAL::object_cast<Edge>(&intersection_obj)) {
-                Point mid = CGAL::midpoint(edge.source(), edge.target());
-                for (int i = 0; i < 2; ++i) {
-                    if (child_polys[i].bounded_side(mid) != CGAL::ON_UNBOUNDED_SIDE) {
-                        child_edges[i].push_back(edge);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    return { child_edges[0], child_edges[1] };
+    return assign_edges_impl(child_tris, edges, split_line, false, 0, 0, nullptr);
 }
 
 std::vector<Edge> filter_degenerate_edges(const std::vector<Edge>& edges) {
@@ -1500,18 +1481,15 @@ int count_min_leaves_recursive(
             std::cerr << "\n[WARNING] Recursive call limit reached (" << MAX_RECURSIVE_CALLS_PER_EVAL 
                       << "). Terminating evaluation early.\n";
             g_decision_log << "[WARNING] Recursive call limit reached. Using heuristic.\n";
-            g_decision_log.flush();
         }
         return estimate_leaves_heuristic(edges);
     }
     
-    if (g_recursive_call_count % LOG_FLUSH_INTERVAL == 0) {
-        std::cerr << "[Recursive] Calls: " << g_recursive_call_count 
-                  << ", Cache hits: " << g_cache_hit_count 
-                  << ", Cache size: " << g_memo_cache.size() 
+    if (log_decisions() && g_recursive_call_count % LOG_FLUSH_INTERVAL == 0) {
+        std::cerr << "[Recursive] Calls: " << g_recursive_call_count
+                  << ", Cache hits: " << g_cache_hit_count
+                  << ", Cache size: " << g_memo_cache.size()
                   << ", Depth: " << depth << "/" << LOOKAHEAD_DEPTH_LIMIT << "\n";
-        std::cerr.flush();
-        g_decision_log.flush();
     }
     
     std::string memo_key = make_triangle_memo_key(triangle, depth);
@@ -1625,12 +1603,13 @@ BestCutResult find_best_split_recursive(
     
     auto eval_start = std::chrono::steady_clock::now();
     
-    g_decision_log << "[Recursive] Starting evaluation for triangle " 
-                   << triangle_to_string(triangle)
-                   << " at depth " << current_depth 
-                   << " with " << edges.size() << " edges"
-                   << " (cache size: " << g_memo_cache.size() << ")\n";
-    g_decision_log.flush();
+    if (log_decisions()) {
+        g_decision_log << "[Recursive] Starting evaluation for triangle "
+                       << triangle_to_string(triangle)
+                       << " at depth " << current_depth
+                       << " with " << edges.size() << " edges"
+                       << " (cache size: " << g_memo_cache.size() << ")\n";
+    }
     
     BestCutResult result;
     
@@ -1645,14 +1624,14 @@ BestCutResult find_best_split_recursive(
     std::vector<SplitCandidate> candidates = generate_split_candidates(triangle, current_edges, all_polygon_edges);
     
     if (candidates.empty()) {
-        g_decision_log << "[Recursive] No valid candidates found.\n";
-        g_decision_log.flush();
+        if (log_decisions())
+            g_decision_log << "[Recursive] No valid candidates found.\n";
         return result;
     }
     
-    g_decision_log << "[Recursive] Evaluating " << candidates.size() << " candidates "
-                   << "(max " << MAX_CANDIDATES_PER_LEVEL << " allowed)...\n";
-    g_decision_log.flush();
+    if (log_decisions())
+        g_decision_log << "[Recursive] Evaluating " << candidates.size() << " candidates "
+                       << "(max " << MAX_CANDIDATES_PER_LEVEL << " allowed)...\n";
     
     int candidates_evaluated = 0;
     
@@ -1714,29 +1693,28 @@ BestCutResult find_best_split_recursive(
             result.priority = cand.priority;
         }
         
-        if (candidates_evaluated % 10 == 0) {
-            g_decision_log << "  [Progress] Evaluated " << candidates_evaluated << "/" 
+        if (verbose_debug() && candidates_evaluated % 10 == 0) {
+            g_decision_log << "  [Progress] Evaluated " << candidates_evaluated << "/"
                           << candidates.size() << " candidates, "
                           << g_recursive_call_count << " recursive calls\n";
-            g_decision_log.flush();
         }
     }
     
     auto eval_end = std::chrono::steady_clock::now();
-    double eval_time = std::chrono::duration<double>(eval_end - eval_start).count();
-    
-    g_decision_log << "[Recursive] Evaluation complete: " << candidates_evaluated << " candidates, "
-                   << g_recursive_call_count << " recursive calls, " 
-                   << g_cache_hit_count << " cache hits, "
-                   << std::fixed << std::setprecision(2) << eval_time << "s\n";
-    if (result.found) {
-        g_decision_log << "[Recursive] Best split: "
-                       << point_to_string(result.split_line.source()) << " -> "
-                       << point_to_string(result.split_line.target())
-                       << " with " << result.min_leaves << " estimated leaves"
-                       << " (priority " << result.priority << ")\n";
+    if (log_decisions()) {
+        double eval_time = std::chrono::duration<double>(eval_end - eval_start).count();
+        g_decision_log << "[Recursive] Evaluation complete: " << candidates_evaluated << " candidates, "
+                       << g_recursive_call_count << " recursive calls, "
+                       << g_cache_hit_count << " cache hits, "
+                       << std::fixed << std::setprecision(2) << eval_time << "s\n";
+        if (result.found) {
+            g_decision_log << "[Recursive] Best split: "
+                           << point_to_string(result.split_line.source()) << " -> "
+                           << point_to_string(result.split_line.target())
+                           << " with " << result.min_leaves << " estimated leaves"
+                           << " (priority " << result.priority << ")\n";
+        }
     }
-    g_decision_log.flush();
     
     return result;
 }
@@ -2018,7 +1996,6 @@ int am_count_min_leaves(const Triangle& triangle,
         if (!g_evaluation_terminated) {
             g_evaluation_terminated = true;
             g_decision_log << "[Angle] Recursive call limit reached. Using heuristic.\n";
-            g_decision_log.flush();
         }
         return estimate_leaves_heuristic(edges);
     }
@@ -2559,26 +2536,24 @@ void process(const Triangle& initial_triangle,
         iteration++;
         cells_processed++;
 
-        double tri_area = area2d(tri);
-
-        debug_fp << "\nIteration " << iteration << " (Cell #" << cells_processed << ") Vertices:\n";
-        for (const auto& v : tri) debug_fp << point_to_string(v) << "\n";
-        debug_fp << "Edge List to process (" << edges.size() << ")\n";
-        if (edges.size() <= 20) {
-            for (const auto& e : edges) debug_fp << point_to_string(e.source()) << " - " << point_to_string(e.target()) << "\n";
-        } else {
-            for (size_t ei = 0; ei < 10; ++ei)
-                debug_fp << point_to_string(edges[ei].source()) << " - " << point_to_string(edges[ei].target()) << "\n";
-            debug_fp << "  ... (" << (edges.size() - 20) << " edges omitted) ...\n";
-            for (size_t ei = edges.size() - 10; ei < edges.size(); ++ei)
-                debug_fp << point_to_string(edges[ei].source()) << " - " << point_to_string(edges[ei].target()) << "\n";
+        if (verbose_debug()) {
+            double tri_area = area2d(tri);
+            debug_fp << "\nIteration " << iteration << " (Cell #" << cells_processed << ") Vertices:\n";
+            for (const auto& v : tri) debug_fp << point_to_string(v) << "\n";
+            debug_fp << "Edge List to process (" << edges.size() << ")\n";
+            if (edges.size() <= 20) {
+                for (const auto& e : edges) debug_fp << point_to_string(e.source()) << " - " << point_to_string(e.target()) << "\n";
+            } else {
+                for (size_t ei = 0; ei < 10; ++ei)
+                    debug_fp << point_to_string(edges[ei].source()) << " - " << point_to_string(edges[ei].target()) << "\n";
+                debug_fp << "  ... (" << (edges.size() - 20) << " edges omitted) ...\n";
+                for (size_t ei = edges.size() - 10; ei < edges.size(); ++ei)
+                    debug_fp << point_to_string(edges[ei].source()) << " - " << point_to_string(edges[ei].target()) << "\n";
+            }
+            debug_fp << "Area: " << std::fixed << std::setprecision(8) << tri_area << "\n";
         }
-        debug_fp << "Area: " << std::fixed << std::setprecision(8) << tri_area << "\n";
 
-        if (iteration % MAIN_LOOP_PROGRESS_INTERVAL == 0 || iteration == 1) {
-            debug_fp.flush();
-            g_decision_log.flush();
-            g_transaction_log.flush();
+        if (iteration % progress_interval() == 0 || iteration == 1) {
             double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
             std::cerr << "[progress] iteration=" << iteration << "/" << max_iter
                       << " (" << std::fixed << std::setprecision(1)
@@ -2586,9 +2561,8 @@ void process(const Triangle& initial_triangle,
                       << " leaves=" << leaves_created
                       << " tri_splits=" << g_triangle_split_count
                       << " line_splits=" << g_line_split_count
-                      << " queue=" << queue.size() 
+                      << " queue=" << queue.size()
                       << " elapsed=" << std::fixed << std::setprecision(1) << elapsed << "s\n";
-            std::cerr.flush();
         }
 
         std::vector<Edge> current_edges;
@@ -2600,8 +2574,8 @@ void process(const Triangle& initial_triangle,
         current_edges = filter_degenerate_edges(current_edges);
 
         if (current_edges.empty()) {
-            debug_fp << "Finalize triangle (no edges left). Leaf #" << (leaves_created + 1) << "\n";
-            debug_fp.flush();
+            if (verbose_debug())
+                debug_fp << "Finalize triangle (no edges left). Leaf #" << (leaves_created + 1) << "\n";
             all_triangles.push_back(tri);
             leaves_created++;
             continue;
@@ -2611,10 +2585,11 @@ void process(const Triangle& initial_triangle,
         std::array<Triangle, 2> split_tris;
         Edge split_line;
 
-        g_decision_log << "\n--- Processing Iteration " << iteration << " ---\n";
-        g_decision_log << "Triangle: " << triangle_to_string(tri) << "\n";
-        g_decision_log << "Edges to process: " << current_edges.size() << "\n";
-        g_decision_log.flush();
+        if (log_decisions()) {
+            g_decision_log << "\n--- Processing Iteration " << iteration << " ---\n";
+            g_decision_log << "Triangle: " << triangle_to_string(tri) << "\n";
+            g_decision_log << "Edges to process: " << current_edges.size() << "\n";
+        }
         
         BestCutResult best = USE_ANGLE_METHOD
             ? find_best_split_angle(tri, current_edges, current_edges)
@@ -2655,6 +2630,8 @@ void process(const Triangle& initial_triangle,
                 g_triangle_split_count, iteration, line_splits_this_iteration);
 
             if (area2d(split_tris[0]) > AREA_TOL) {
+                // Children of a split are independent and can be processed in
+                // parallel; the current queue is sequential (see notes in chat).
                 queue.push({ split_tris[0], filter_degenerate_edges(child_edges1) });
             }
             if (area2d(split_tris[1]) > AREA_TOL) {
@@ -2665,36 +2642,38 @@ void process(const Triangle& initial_triangle,
             if (best.priority == 0) poly_edge_splits++;
             else if (best.priority == 1) zero_crossing_splits++;
             else boundary_crossing_splits++;
-            debug_fp << "Found optimal lookahead split (" << priority_str << ") with split line " 
-                     << point_to_string(split_line.source()) << " - " 
-                     << point_to_string(split_line.target()) 
-                     << " (estimated " << best.min_leaves << " final triangles). Split #" << splits_performed << "\n";
-            if (!line_splits_this_iteration.empty()) {
-                debug_fp << "  Line splits caused: " << line_splits_this_iteration.size() << "\n";
-                for (const auto& ls : line_splits_this_iteration) {
-                    debug_fp << "    LINE_SPLIT #" << ls.split_id
-                             << ": " << edge_to_string(ls.original_edge)
-                             << " at " << point_to_string(ls.split_point) << "\n";
+            if (verbose_debug()) {
+                debug_fp << "Found optimal lookahead split (" << priority_str << ") with split line "
+                         << point_to_string(split_line.source()) << " - "
+                         << point_to_string(split_line.target())
+                         << " (estimated " << best.min_leaves << " final triangles). Split #" << splits_performed << "\n";
+                if (!line_splits_this_iteration.empty()) {
+                    debug_fp << "  Line splits caused: " << line_splits_this_iteration.size() << "\n";
+                    for (const auto& ls : line_splits_this_iteration) {
+                        debug_fp << "    LINE_SPLIT #" << ls.split_id
+                                 << ": " << edge_to_string(ls.original_edge)
+                                 << " at " << point_to_string(ls.split_point) << "\n";
+                    }
                 }
             }
-
-            g_decision_log << "FINAL DECISION: Split at "
-                          << point_to_string(split_line.source()) << " -> "
-                          << point_to_string(split_line.target()) << "\n";
-            g_decision_log << "Estimated leaves from this split: " << best.min_leaves << "\n";
-            g_decision_log << "Priority: " << best.priority
-                          << " (" << priority_str << ")\n";
-            g_decision_log << "Triangle Split #" << g_triangle_split_count << " (Lookahead)\n";
-            g_decision_log << "Line splits this iteration: " << line_splits_this_iteration.size() << "\n";
-            for (const auto& ls : line_splits_this_iteration) {
-                g_decision_log << "  LINE_SPLIT #" << ls.split_id
-                              << " | Edge: " << edge_to_string(ls.original_edge)
-                              << " | Split at: " << point_to_string(ls.split_point)
-                              << " | Seg1: " << edge_to_string(ls.segment1)
-                              << " | Seg2: " << edge_to_string(ls.segment2) << "\n";
+            if (log_decisions()) {
+                g_decision_log << "FINAL DECISION: Split at "
+                              << point_to_string(split_line.source()) << " -> "
+                              << point_to_string(split_line.target()) << "\n";
+                g_decision_log << "Estimated leaves from this split: " << best.min_leaves << "\n";
+                g_decision_log << "Priority: " << best.priority
+                              << " (" << priority_str << ")\n";
+                g_decision_log << "Triangle Split #" << g_triangle_split_count << " (Lookahead)\n";
+                g_decision_log << "Line splits this iteration: " << line_splits_this_iteration.size() << "\n";
+                for (const auto& ls : line_splits_this_iteration) {
+                    g_decision_log << "  LINE_SPLIT #" << ls.split_id
+                                  << " | Edge: " << edge_to_string(ls.original_edge)
+                                  << " | Split at: " << point_to_string(ls.split_point)
+                                  << " | Seg1: " << edge_to_string(ls.segment1)
+                                  << " | Seg2: " << edge_to_string(ls.segment2) << "\n";
+                }
+                g_decision_log << "\n";
             }
-            g_decision_log << "\n";
-            
             split_found = true;
         }
         else {
@@ -2741,8 +2720,9 @@ void process(const Triangle& initial_triangle,
                 else boundary_crossing_splits++;
                 std::string greedy_pri_str = greedy_is_poly ? "POLYGON_EDGE" :
                     (greedy_crossings == 0 ? "ZERO_CROSSING" : "BOUNDARY_CROSSING");
-                debug_fp << "Found greedy fallback split (" << greedy_pri_str << ") with split line " 
-                         << point_to_string(split_line.source()) << " - " 
+                if (verbose_debug()) {
+                debug_fp << "Found greedy fallback split (" << greedy_pri_str << ") with split line "
+                         << point_to_string(split_line.source()) << " - "
                          << point_to_string(split_line.target()) << ". Split #" << splits_performed << " (Greedy)\n";
                 if (!line_splits_this_iteration.empty()) {
                     debug_fp << "  Line splits caused: " << line_splits_this_iteration.size() << "\n";
@@ -2752,6 +2732,8 @@ void process(const Triangle& initial_triangle,
                                  << " at " << point_to_string(ls.split_point) << "\n";
                     }
                 }
+                }
+                if (log_decisions()) {
                 g_decision_log << "FALLBACK: Greedy split at "
                               << point_to_string(split_line.source()) << " -> "
                               << point_to_string(split_line.target()) << "\n";
@@ -2765,6 +2747,7 @@ void process(const Triangle& initial_triangle,
                                   << " | Seg2: " << edge_to_string(ls.segment2) << "\n";
                 }
                 g_decision_log << "\n";
+                }
                 split_found = true;
             }
         }
@@ -2773,8 +2756,10 @@ void process(const Triangle& initial_triangle,
             continue;
         }
 
-        debug_fp << "No valid split found (finalizing triangle as fallback). Leaf #" << (leaves_created + 1) << "\n";
-        g_decision_log << "NO SPLIT FOUND: Finalizing triangle as Leaf #" << (leaves_created + 1) << "\n\n";
+        if (verbose_debug())
+            debug_fp << "No valid split found (finalizing triangle as fallback). Leaf #" << (leaves_created + 1) << "\n";
+        if (log_decisions())
+            g_decision_log << "NO SPLIT FOUND: Finalizing triangle as Leaf #" << (leaves_created + 1) << "\n\n";
         all_triangles.push_back(tri);
         leaves_created++;
     }
@@ -3020,6 +3005,9 @@ void process(const Triangle& initial_triangle,
     g_transaction_log << "================================\n";
     g_transaction_log << "TOTAL TRANSACTIONS:           " << total_transactions << std::endl;
     g_transaction_log << "================================\n";
+    debug_fp.flush();
+    g_decision_log.flush();
+    g_transaction_log.flush();
 }
 
 // =========================================================================
@@ -4581,6 +4569,8 @@ int main(int argc, char* argv[]) {
                       << "                       lower-leaf decompositions at increasing runtime cost.\n"
                       << "  --no-quantize        Skip fixed-point quantization / walkable\n"
                       << "                       boundary publishing step\n"
+                      << "  --quiet              Progress + AGS records + CSVs; skip per-iteration debug\n"
+                      << "  --verbose            Dump every cell's vertices/edges to debug_out_lookahead.txt\n"
                       << "  --reduce <pct>       Reduction % (overrides positional)\n"
                       << "  --header <path>      Output CGAL header (default: polygon_output.h)\n"
                       << "  --points <path>      Output points file (default: polygon_output.txt)\n"
@@ -4614,7 +4604,8 @@ int main(int argc, char* argv[]) {
             if (std::strcmp(opt, "--no-header") == 0 || std::strcmp(opt, "--no-points") == 0 ||
                 std::strcmp(opt, "--list-states") == 0 || std::strcmp(opt, "--list-counties") == 0 ||
                 std::strcmp(opt, "--angle-method") == 0 || std::strcmp(opt, "--legacy-lookahead") == 0 ||
-                std::strcmp(opt, "--no-quantize") == 0) {
+                std::strcmp(opt, "--no-quantize") == 0 || std::strcmp(opt, "--quiet") == 0 ||
+                std::strcmp(opt, "--verbose") == 0) {
                 // flag only
             } else {
                 ++i; // skip value
@@ -4652,6 +4643,10 @@ int main(int argc, char* argv[]) {
             USE_ANGLE_METHOD = false;
         else if (std::strcmp(argv[i], "--no-quantize") == 0)
             QUANTIZE_TRANSACTIONS = false;
+        else if (std::strcmp(argv[i], "--quiet") == 0)
+            G_VERBOSITY = 0;
+        else if (std::strcmp(argv[i], "--verbose") == 0)
+            G_VERBOSITY = 2;
         else if ((std::strcmp(argv[i], "--num-states") == 0 ||
                   std::strcmp(argv[i], "--states") == 0) && i + 1 < argc)
             num_states = std::atoi(argv[++i]);

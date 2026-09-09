@@ -53,11 +53,12 @@ The tool replaces the need for pre-built polygon header files (`texas_boundary.h
 
 ## Prerequisites
 
-| Dependency | Purpose | Install (Windows vcpkg) |
-|---|---|---|
-| Visual Studio 2022 | C++17 compiler | Already installed |
-| CGAL | Exact geometry kernel | `vcpkg install cgal:x64-windows` |
-| shapelib | Shapefile reader | `vcpkg install shapelib:x64-windows` |
+| Dependency | Purpose | Windows (vcpkg) | Linux (apt) |
+|---|---|---|---|
+| C++17 compiler | Build | Visual Studio 2022 | `g++` (13+) |
+| CGAL | Exact geometry kernel | `vcpkg install cgal:x64-windows` | `libcgal-dev` (5.6) |
+| shapelib | Shapefile reader | `vcpkg install shapelib:x64-windows` | `libshp-dev` |
+| GMP / MPFR | CGAL exact numbers | pulled in by vcpkg | `libgmp-dev` `libmpfr-dev` |
 
 If you haven't set up vcpkg yet:
 
@@ -108,7 +109,37 @@ cl /std:c++17 /EHsc /O2 /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
 
 Adjust the vcpkg paths to match your installation.
 
-> **Note:** This source was also verified to compile and link cleanly under g++ 13 with CGAL 5.6 + libshp on Linux. The intersection code uses the same `CGAL::Object` / `CGAL::object_cast` pattern throughout, so it builds consistently across both toolchains. Your authoritative build remains VS2022 + vcpkg (x64).
+> **Note:** This source compiles and links under g++ 13 with CGAL 5.6 + libshp on Linux. The intersection code uses the same `CGAL::Object` / `CGAL::object_cast` pattern throughout, so it builds consistently across both toolchains. Your authoritative Windows build remains VS2022 + vcpkg (x64).
+
+### Linux (g++ / Make)
+
+**Option A — system packages** (needs sudo):
+
+```bash
+sudo apt-get install -y g++ make libcgal-dev libshp-dev libgmp-dev libmpfr-dev
+make
+```
+
+**Option B — no root** (extracts Ubuntu `.deb` files into `~/.local/tridecomp-deps`):
+
+```bash
+make deps
+make
+```
+
+The Makefile prefers `/usr/include/CGAL` when present; otherwise it uses the local prefix and statically links shapelib, GMP, and MPFR so you do not need `LD_LIBRARY_PATH`.
+
+Smoke-test with a synthetic 4-vertex square:
+
+```bash
+make test
+```
+
+Then run against a real shapefile the same way as on Windows, substituting `./TriDecomp` for `TriDecomp.exe`:
+
+```bash
+./TriDecomp tl_2024_us_state.shp 50 --state 53
+```
 
 ---
 
@@ -137,6 +168,8 @@ TriDecomp.exe <shapefile.shp> [reduction_%] [options]
 | `--legacy-lookahead` | | Use the legacy recursive lookahead engine instead (for A/B comparison) |
 | `--lookahead <N>` | `0` | Lookahead depth for **both** the angle method and the legacy engine (`0` = greedy). Higher `N` yields lower-leaf decompositions at increasing runtime cost. |
 | `--no-quantize` | | Skip the fixed-point quantization / walkable-boundary publishing step |
+| `--quiet` | | Progress + AGS records + CSVs only; skip per-iteration debug dumps. Logs are buffered (flushed at the end of the run). |
+| `--verbose` | | Dump every cell's vertices and edges to `debug_out_lookahead.txt` |
 | `--reduce <pct>` | *(positional)* | Alternative way to specify reduction % |
 | `--header <path>` | `polygon_output.h` | Output CGAL header file path |
 | `--points <path>` | `polygon_output.txt` | Output points file path |
