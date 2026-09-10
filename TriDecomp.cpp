@@ -120,6 +120,7 @@
 #include <cstdint>
 #include <CGAL/Vector_2.h>
 #include <shapefil.h>
+#include "tridecomp_api.h"
 
 // Portable directory operations for multi-state batch mode.
 #ifdef _WIN32
@@ -2238,6 +2239,8 @@ struct MarkResult {
     std::unordered_map<long long,int>    poly_edge_by_key; // edge key -> polygon edge idx
 };
 
+static MarkResult g_last_mark;
+
 // Absolute polygon area via a flat double-precision shoelace sum. Using the
 // kernel's Polygon::area() on a 10k+ vertex polygon builds a Lazy_exact_nt
 // expression tree thousands of nodes deep, whose recursive evaluation/teardown
@@ -2805,6 +2808,7 @@ void process(const Triangle& initial_triangle,
         if (area2d(tri) > AREA_TOL) leaves.push_back(tri);
 
     MarkResult mark = mark_triangles_perwalk(leaves, polygon_edges, polygon, g_decision_log);
+    g_last_mark = mark;
     g_leaf_triangles    = leaves;
     g_leaf_region_codes = mark.codes;
     g_mark_triangle_count = mark.inside_count;   // L^I MarkTriangles transactions
@@ -3803,6 +3807,7 @@ static void reset_pipeline_globals() {
     g_recursive_call_count = 0;
     g_cache_hit_count = 0;
     g_memo_cache.clear();
+    g_last_mark = MarkResult();
     MAX_CANDIDATES_PER_LEVEL = DEFAULT_MAX_CANDIDATES;
     if (g_decision_log.is_open())    g_decision_log.close();
     if (g_transaction_log.is_open()) g_transaction_log.close();
@@ -4523,7 +4528,240 @@ static int run_one_state(const StateConfig& cfg, StateSummary& sum) {
     return 0;
 }
 
+// =========================================================================
+// Python / in-memory API: polygon + enclosing triangle, no shapefile, no files.
+// =========================================================================
+static void td_xy(const Point& p, double o[2]) {
+    o[0] = CGAL::to_double(p.x());
+    o[1] = CGAL::to_double(p.y());
+}
 
+static void td_fill_tri(const Triangle& tri, TDTri& out) {
+    for (int i = 0; i < 3; ++i) td_xy(tri[i], out.v[i]);
+}
+
+static void td_fill_edge(const Edge& e, TDEdge& out) {
+    td_xy(e.source(), out.a);
+    td_xy(e.target(), out.b);
+}
+
+static const char* td_region_name(int code) {
+    if (code == REGION_INSIDE) return "INSIDE";
+    if (code == REGION_OUTSIDE) return "OUTSIDE";
+    return "BOUNDARY";
+}
+
+TDResult tridecomp_from_xy(const double* p_xy, int n,
+                           const double* t_xy, bool verbose)
+{
+    TDResult R;
+    if (!p_xy || !t_xy || n < 3) {
+        R.error = "p must have at least 3 vertices and t must be a (3,2) triangle";
+        return R;
+    }
+
+    reset_pipeline_globals();
+    G_VERBOSITY = verbose ? 1 : 0;
+    QUANTIZE_TRANSACTIONS = true;
+    USE_ANGLE_METHOD = true;
+    LOOKAHEAD_DEPTH_LIMIT = 0;
+
+    std::vector<Point> pts;
+    pts.reserve(n);
+    for (int i = 0; i < n; ++i)
+        pts.emplace_back(p_xy[2 * i], p_xy[2 * i + 1]);
+    if (pts.size() >= 2 && point_eq(pts.front(), pts.back()))
+        pts.pop_back();
+    if (pts.size() < 3) {
+        R.error = "p has fewer than 3 vertices after dropping the closing point";
+        return R;
+    }
+
+    Polygon polygon(pts.begin(), pts.end());
+    if (!polygon.is_simple()) {
+        R.error = "polygon is not simple";
+        return R;
+    }
+    if (polygon.is_clockwise_oriented()) {
+        polygon.reverse_orientation();
+        pts.assign(polygon.vertices_begin(), polygon.vertices_end());
+    }
+
+    std::vector<Edge> polygon_edges;
+    polygon_edges.reserve(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i)
+        polygon_edges.emplace_back(pts[i], pts[(i + 1) % pts.size()]);
+
+    Point tv[3] = {
+        Point(t_xy[0], t_xy[1]),
+        Point(t_xy[2], t_xy[3]),
+        Point(t_xy[4], t_xy[5])
+    };
+    double signed_area = CGAL::to_double(Triangle_cgal(tv[0], tv[1], tv[2]).area());
+    if (std::abs(signed_area) <= AREA_TOL) {
+        R.error = "enclosing triangle has near-zero area";
+        return R;
+    }
+    if (signed_area < 0.0)
+        std::swap(tv[1], tv[2]);
+    Triangle initial = { tv[0], tv[1], tv[2] };
+
+#ifdef _WIN32
+    const char* kNull = "nul";
+#else
+    const char* kNull = "/dev/null";
+#endif
+    g_transaction_log.open(kNull);
+    g_decision_log.open(kNull);
+    std::ofstream debug_fp(kNull);
+
+    std::streambuf* cout_old = nullptr;
+    std::streambuf* cerr_old = nullptr;
+    std::ofstream null_out;
+    if (!verbose) {
+        null_out.open(kNull);
+        cout_old = std::cout.rdbuf(null_out.rdbuf());
+        cerr_old = std::cerr.rdbuf(null_out.rdbuf());
+    }
+
+    compute_dynamic_limits(static_cast<int>(polygon_edges.size()));
+    std::vector<FinalTriangle> inside_triangles;
+    process(initial, polygon_edges, polygon, debug_fp, inside_triangles);
+
+    if (!verbose) {
+        std::cout.rdbuf(cout_old);
+        std::cerr.rdbuf(cerr_old);
+    }
+
+    R.triangle_splits.reserve(g_triangle_splits.size());
+    for (const auto& rec : g_triangle_splits) {
+        TDSplit s;
+        s.split_id = rec.split_id;
+        s.iteration = rec.iteration;
+        s.is_lookahead = rec.is_lookahead ? 1 : 0;
+        td_fill_tri(rec.parent_triangle, s.parent);
+        td_fill_tri(rec.child1, s.child1);
+        td_fill_tri(rec.child2, s.child2);
+        td_fill_edge(rec.split_line, s.split_line);
+        R.triangle_splits.push_back(s);
+    }
+
+    R.line_splits.reserve(g_line_splits.size());
+    for (const auto& rec : g_line_splits) {
+        TDLineSplit s;
+        s.split_id = rec.split_id;
+        s.triangle_split_id = rec.triangle_split_id;
+        s.iteration = rec.iteration;
+        td_fill_edge(rec.original_edge, s.original_edge);
+        td_fill_edge(rec.segment1, s.segment1);
+        td_fill_edge(rec.segment2, s.segment2);
+        td_xy(rec.split_point, s.split_point);
+        QPoint qp = quantize(rec.split_point);
+        s.qx = (std::int64_t)qp.X;
+        s.qy = (std::int64_t)qp.Y;
+        R.line_splits.push_back(s);
+    }
+
+    R.marks.reserve(g_leaf_triangles.size());
+    for (size_t i = 0; i < g_leaf_triangles.size(); ++i) {
+        const Triangle& tri = g_leaf_triangles[i];
+        int rc = (i < g_leaf_region_codes.size()) ? g_leaf_region_codes[i] : REGION_BOUNDARY;
+        TDMark m;
+        m.leaf_id = (int)i + 1;
+        m.region_code = rc;
+        m.region = td_region_name(rc);
+        td_fill_tri(tri, m.vertices);
+        m.area = area2d(tri);
+        QPoint q0 = quantize(tri[0]), q1 = quantize(tri[1]), q2 = quantize(tri[2]);
+        m.qv[0][0] = q0.X; m.qv[0][1] = q0.Y;
+        m.qv[1][0] = q1.X; m.qv[1][1] = q1.Y;
+        m.qv[2][0] = q2.X; m.qv[2][1] = q2.Y;
+        R.marks.push_back(m);
+    }
+
+    // Rebuild quantized walk (same construction as emit_quantized_walkable_transactions).
+    std::vector<double> lsx(g_line_splits.size()), lsy(g_line_splits.size());
+    for (size_t k = 0; k < g_line_splits.size(); ++k) {
+        lsx[k] = CGAL::to_double(g_line_splits[k].split_point.x());
+        lsy[k] = CGAL::to_double(g_line_splits[k].split_point.y());
+    }
+    const double BB_EPS = 1e-9;
+    int seq = 0;
+    std::vector<std::array<QPoint, 2>> qwalk;
+    qwalk.reserve(polygon_edges.size() + g_line_splits.size());
+    for (const auto& E : polygon_edges) {
+        const Point& A = E.source();
+        const Point& B = E.target();
+        K::Vector_2 dir = B - A;
+        K::FT dlen2 = dir * dir;
+        double Ax = CGAL::to_double(A.x()), Ay = CGAL::to_double(A.y());
+        double Bx = CGAL::to_double(B.x()), By = CGAL::to_double(B.y());
+        double minx = std::min(Ax, Bx) - BB_EPS, maxx = std::max(Ax, Bx) + BB_EPS;
+        double miny = std::min(Ay, By) - BB_EPS, maxy = std::max(Ay, By) + BB_EPS;
+        struct OnEdge { Point p; K::FT t; };
+        std::vector<OnEdge> mids;
+        if (dlen2 != K::FT(0)) {
+            for (size_t k = 0; k < g_line_splits.size(); ++k) {
+                if (lsx[k] < minx || lsx[k] > maxx || lsy[k] < miny || lsy[k] > maxy)
+                    continue;
+                const Point& P = g_line_splits[k].split_point;
+                if (!CGAL::collinear(A, B, P)) continue;
+                K::FT t = ((P - A) * dir) / dlen2;
+                if (t > K::FT(0) && t < K::FT(1)) {
+                    bool dup = false;
+                    for (const auto& m : mids) if (m.p == P) { dup = true; break; }
+                    if (!dup) mids.push_back({ P, t });
+                }
+            }
+        }
+        std::sort(mids.begin(), mids.end(),
+                  [](const OnEdge& a, const OnEdge& b){ return a.t < b.t; });
+        Point prev = A;
+        auto emit_seg = [&](const Point& s, const Point& tt) {
+            QPoint qs = quantize(s), qt = quantize(tt);
+            qwalk.push_back({ qs, qt });
+            TDWalkSeg w;
+            w.seq = seq++;
+            w.sx = CGAL::to_double(s.x());  w.sy = CGAL::to_double(s.y());
+            w.tx = CGAL::to_double(tt.x()); w.ty = CGAL::to_double(tt.y());
+            w.qsx = qs.X; w.qsy = qs.Y; w.qtx = qt.X; w.qty = qt.Y;
+            R.walk.push_back(w);
+        };
+        for (const auto& m : mids) { emit_seg(prev, m.p); prev = m.p; }
+        emit_seg(prev, B);
+    }
+
+    bool connected = true;
+    for (size_t i = 0; i + 1 < qwalk.size(); ++i) {
+        if (qwalk[i][1].X != qwalk[i + 1][0].X || qwalk[i][1].Y != qwalk[i + 1][0].Y) {
+            connected = false; break;
+        }
+    }
+    bool closed = false;
+    if (!qwalk.empty())
+        closed = (qwalk.back()[1].X == qwalk.front()[0].X &&
+                  qwalk.back()[1].Y == qwalk.front()[0].Y);
+
+    R.stats.n_polygon = (int)pts.size();
+    R.stats.n_splits = (int)R.triangle_splits.size();
+    R.stats.n_line_splits = (int)R.line_splits.size();
+    R.stats.n_leaves = (int)R.marks.size();
+    R.stats.n_interior = g_last_mark.inside_count;
+    R.stats.n_exterior = g_last_mark.outside_count;
+    R.stats.perwalk_seeds = g_last_mark.perwalk_inside_seeds;
+    R.stats.flood_added = g_last_mark.flood_added;
+    R.stats.flood_unreached = g_last_mark.flood_unreached;
+    R.stats.inside_area = g_last_mark.inside_area;
+    R.stats.polygon_area = g_last_mark.polygon_area;
+    R.stats.area_ok = g_last_mark.area_ok;
+    R.stats.walkable = connected && closed && !qwalk.empty();
+
+    g_transaction_log.close();
+    g_decision_log.close();
+    return R;
+}
+
+#ifndef TRIDECOMP_NO_MAIN
 int main(int argc, char* argv[]) {
     // --- Parse Command-Line Arguments ---
     std::string shapefile_path;
@@ -4808,3 +5046,4 @@ int main(int argc, char* argv[]) {
     else             write_summary_table(summaries);
     return 0;
 }
+#endif // TRIDECOMP_NO_MAIN

@@ -22,12 +22,26 @@ else
   SHP_LIB  = -lshp
 endif
 
-.PHONY: all clean deps test
+.PHONY: all clean deps test python
 
 all: TriDecomp
 
 TriDecomp: TriDecomp.cpp
 	$(CXX) $(CXXFLAGS) $(INCFLAGS) -o $@ $< $(LDFLAGS) $(LIBS)
+
+PY ?= $(HOME)/miniconda3/envs/tridecomp-py/bin/python
+PY_INCS = $(shell $(PY) -c "import sysconfig,numpy; print('-I'+sysconfig.get_path('include')+' -I'+numpy.get_include())")
+PY_EXT  = $(shell $(PY) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+PY_LIBDIR = $(shell $(PY) -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+PY_LDLIB  = $(shell $(PY) -c "import sys; print('python%d.%d' % sys.version_info[:2])")
+
+python: python/tridecomp/_cpp$(PY_EXT)
+
+python/tridecomp/_cpp$(PY_EXT): TriDecomp.cpp python/tridecomp/_cpp.cpp tridecomp_api.h
+	$(CXX) -shared -fPIC $(CXXFLAGS) -DTRIDECOMP_NO_MAIN \
+	    $(INCFLAGS) $(PY_INCS) -I. \
+	    -o $@ python/tridecomp/_cpp.cpp TriDecomp.cpp \
+	    $(LDFLAGS) $(LIBS) -L$(PY_LIBDIR) -l$(PY_LDLIB)
 
 # Download and extract Ubuntu packages into $(LOCAL_PREFIX) (no root required).
 deps:
@@ -48,4 +62,5 @@ test: TriDecomp tools/make_test_shp
 
 clean:
 	rm -f TriDecomp tools/make_test_shp
-	rm -rf testdata
+	rm -f python/tridecomp/_cpp*.so python/tridecomp/*.pyc
+	rm -rf testdata python/tridecomp/__pycache__
