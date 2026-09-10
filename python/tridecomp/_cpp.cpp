@@ -17,15 +17,6 @@ static PyObject* npy_f64(const double* data, npy_intp rows, npy_intp cols)
     return arr;
 }
 
-static PyObject* npy_i64(const std::int64_t* data, npy_intp rows, npy_intp cols)
-{
-    npy_intp dims[2] = { rows, cols };
-    PyObject* arr = PyArray_SimpleNew(2, dims, NPY_INT64);
-    if (!arr) return NULL;
-    std::memcpy(PyArray_DATA((PyArrayObject*)arr), data, (size_t)(rows * cols) * sizeof(std::int64_t));
-    return arr;
-}
-
 static PyObject* npy_f64_1d(const double* data, npy_intp n)
 {
     PyObject* arr = PyArray_SimpleNew(1, &n, NPY_FLOAT64);
@@ -34,174 +25,112 @@ static PyObject* npy_f64_1d(const double* data, npy_intp n)
     return arr;
 }
 
-static PyObject* npy_i64_1d(const std::int64_t* data, npy_intp n)
+static PyObject* line_split_dict(const TDLineSplit& s)
 {
-    PyObject* arr = PyArray_SimpleNew(1, &n, NPY_INT64);
-    if (!arr) return NULL;
-    std::memcpy(PyArray_DATA((PyArrayObject*)arr), data, (size_t)n * sizeof(std::int64_t));
-    return arr;
+    return Py_BuildValue(
+        "{s:N,s:N,s:(NN)}",
+        "edge", npy_f64(&s.original_edge.a[0], 2, 2),
+        "point", npy_f64_1d(s.split_point, 2),
+        "seg", npy_f64(&s.segment1.a[0], 2, 2), npy_f64(&s.segment2.a[0], 2, 2));
 }
 
-static PyObject* result_to_dict(TDResult& R)
+static PyObject* events_to_list(TDTessellation& R)
 {
     if (!R.error.empty()) {
         PyErr_SetString(PyExc_RuntimeError, R.error.c_str());
         return NULL;
     }
 
-    PyObject* splits = PyList_New((Py_ssize_t)R.triangle_splits.size());
-    if (!splits) return NULL;
-    for (size_t i = 0; i < R.triangle_splits.size(); ++i) {
-        const TDSplit& s = R.triangle_splits[i];
-        PyObject* d = Py_BuildValue(
-            "{s:i,s:i,s:i,s:i,s:N,s:N,s:N,s:N}",
-            "split_id", s.split_id,
-            "iteration", s.iteration,
-            "priority", s.priority,
-            "is_lookahead", s.is_lookahead,
-            "parent", npy_f64(&s.parent.v[0][0], 3, 2),
-            "child1", npy_f64(&s.child1.v[0][0], 3, 2),
-            "child2", npy_f64(&s.child2.v[0][0], 3, 2),
-            "split_line", npy_f64(&s.split_line.a[0], 2, 2));
-        if (!d) { Py_DECREF(splits); return NULL; }
-        PyList_SET_ITEM(splits, (Py_ssize_t)i, d);
-    }
-
-    PyObject* lines = PyList_New((Py_ssize_t)R.line_splits.size());
-    if (!lines) { Py_DECREF(splits); return NULL; }
-    for (size_t i = 0; i < R.line_splits.size(); ++i) {
-        const TDLineSplit& s = R.line_splits[i];
-        std::int64_t qp[2] = { s.qx, s.qy };
-        PyObject* d = Py_BuildValue(
-            "{s:i,s:i,s:i,s:N,s:N,s:N,s:N,s:N}",
-            "split_id", s.split_id,
-            "triangle_split_id", s.triangle_split_id,
-            "iteration", s.iteration,
-            "original_edge", npy_f64(&s.original_edge.a[0], 2, 2),
-            "segment1", npy_f64(&s.segment1.a[0], 2, 2),
-            "segment2", npy_f64(&s.segment2.a[0], 2, 2),
-            "split_point", npy_f64_1d(s.split_point, 2),
-            "quantized_point", npy_i64_1d(qp, 2));
-        if (!d) { Py_DECREF(splits); Py_DECREF(lines); return NULL; }
-        PyList_SET_ITEM(lines, (Py_ssize_t)i, d);
-    }
-
-    PyObject* marks = PyList_New((Py_ssize_t)R.marks.size());
-    if (!marks) { Py_DECREF(splits); Py_DECREF(lines); return NULL; }
-    for (size_t i = 0; i < R.marks.size(); ++i) {
-        const TDMark& m = R.marks[i];
-        PyObject* sides = PyList_New(0);
-        PyObject* d = Py_BuildValue(
-            "{s:i,s:i,s:s,s:N,s:d,s:N,s:N}",
-            "leaf_id", m.leaf_id,
-            "region_code", m.region_code,
-            "region", m.region.c_str(),
-            "vertices", npy_f64(&m.vertices.v[0][0], 3, 2),
-            "area", m.area,
-            "quantized", npy_i64(&m.qv[0][0], 3, 2),
-            "polygon_sides", sides);
-        if (!d) { Py_DECREF(splits); Py_DECREF(lines); Py_DECREF(marks); return NULL; }
-        PyList_SET_ITEM(marks, (Py_ssize_t)i, d);
-    }
-
-    PyObject* walk = PyList_New((Py_ssize_t)R.walk.size());
-    if (!walk) { Py_DECREF(splits); Py_DECREF(lines); Py_DECREF(marks); return NULL; }
-    for (size_t i = 0; i < R.walk.size(); ++i) {
-        const TDWalkSeg& w = R.walk[i];
-        double exact[4] = { w.sx, w.sy, w.tx, w.ty };
-        std::int64_t q[4] = { w.qsx, w.qsy, w.qtx, w.qty };
-        PyObject* d = Py_BuildValue(
-            "{s:i,s:N,s:N}",
-            "seq", w.seq,
-            "exact", npy_f64(exact, 2, 2),
-            "quantized", npy_i64(q, 2, 2));
-        if (!d) {
-            Py_DECREF(splits); Py_DECREF(lines); Py_DECREF(marks); Py_DECREF(walk);
-            return NULL;
+    PyObject* events = PyList_New((Py_ssize_t)R.events.size());
+    if (!events) return NULL;
+    for (size_t i = 0; i < R.events.size(); ++i) {
+        const TDSplitEvent& e = R.events[i];
+        PyObject* lines = PyList_New((Py_ssize_t)e.line_splits.size());
+        if (!lines) { Py_DECREF(events); return NULL; }
+        for (size_t k = 0; k < e.line_splits.size(); ++k) {
+            PyObject* ls = line_split_dict(e.line_splits[k]);
+            if (!ls) { Py_DECREF(lines); Py_DECREF(events); return NULL; }
+            PyList_SET_ITEM(lines, (Py_ssize_t)k, ls);
         }
-        PyList_SET_ITEM(walk, (Py_ssize_t)i, d);
+        PyObject* d = Py_BuildValue(
+            "{s:s,s:s,s:s,s:N,s:N,s:(NN),s:N}",
+            "id", e.id.c_str(),
+            "child0", e.child0.c_str(),
+            "child1", e.child1.c_str(),
+            "parent", npy_f64(&e.parent.v[0][0], 3, 2),
+            "cut", npy_f64(&e.cut.a[0], 2, 2),
+            "child", npy_f64(&e.child[0].v[0][0], 3, 2), npy_f64(&e.child[1].v[0][0], 3, 2),
+            "line_splits", lines);
+        if (!d) { Py_DECREF(events); return NULL; }
+        PyList_SET_ITEM(events, (Py_ssize_t)i, d);
     }
-
-    PyObject* stats = Py_BuildValue(
-        "{s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:d,s:d,s:O,s:O,s:s}",
-        "n_polygon", R.stats.n_polygon,
-        "n_splits", R.stats.n_splits,
-        "n_line_splits", R.stats.n_line_splits,
-        "n_leaves", R.stats.n_leaves,
-        "n_interior", R.stats.n_interior,
-        "n_exterior", R.stats.n_exterior,
-        "perwalk_seeds", R.stats.perwalk_seeds,
-        "flood_added", R.stats.flood_added,
-        "flood_unreached", R.stats.flood_unreached,
-        "inside_area", R.stats.inside_area,
-        "polygon_area", R.stats.polygon_area,
-        "area_ok", R.stats.area_ok ? Py_True : Py_False,
-        "walkable", R.stats.walkable ? Py_True : Py_False,
-        "engine", "cpp");
-    if (!stats) {
-        Py_DECREF(splits); Py_DECREF(lines); Py_DECREF(marks); Py_DECREF(walk);
-        return NULL;
-    }
-
-    PyObject* out = Py_BuildValue(
-        "{s:N,s:N,s:N,s:N,s:N}",
-        "triangle_splits", splits,
-        "line_splits", lines,
-        "marks", marks,
-        "walk", walk,
-        "stats", stats);
-    return out;
+    return events;
 }
 
-static PyObject* py_tridecomp(PyObject* /*self*/, PyObject* args, PyObject* kwargs)
+static int as_segments(PyObject* obj, std::vector<double>& flat, int* nseg)
 {
-    static const char* kwlist[] = { "p", "t", "verbose", NULL };
-    PyObject *pobj = NULL, *tobj = NULL;
+    PyArrayObject* a = (PyArrayObject*)PyArray_FROM_OTF(obj, NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
+    if (!a) return -1;
+    const int nd = PyArray_NDIM(a);
+    const npy_intp* dims = PyArray_DIMS(a);
+    if (nd == 3 && dims[1] == 2 && dims[2] == 2) {
+        *nseg = (int)dims[0];
+    } else if (nd == 2 && dims[1] == 4) {
+        *nseg = (int)dims[0];
+    } else {
+        Py_DECREF(a);
+        PyErr_SetString(PyExc_ValueError, "segments must have shape (M, 2, 2) or (M, 4)");
+        return -1;
+    }
+    const npy_intp n = (npy_intp)(*nseg) * 4;
+    flat.resize((size_t)n);
+    std::memcpy(flat.data(), PyArray_DATA(a), (size_t)n * sizeof(double));
+    Py_DECREF(a);
+    return 0;
+}
+
+static PyObject* py_tessellate(PyObject* /*self*/, PyObject* args, PyObject* kwargs)
+{
+    static const char* kwlist[] = { "segments", "t", "start", "verbose", NULL };
+    PyObject *sobj = NULL, *tobj = NULL;
+    const char* start = "";
     int verbose = 0;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|p:tridecomp",
-                                     (char**)kwlist, &pobj, &tobj, &verbose))
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|$sp:tessellate",
+                                     (char**)kwlist, &sobj, &tobj, &start, &verbose))
         return NULL;
 
-    PyArrayObject* pa = (PyArrayObject*)PyArray_FROM_OTF(pobj, NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
-    PyArrayObject* ta = (PyArrayObject*)PyArray_FROM_OTF(tobj, NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
-    if (!pa || !ta) {
-        Py_XDECREF(pa); Py_XDECREF(ta);
-        PyErr_SetString(PyExc_TypeError, "p and t must be array-like float64");
+    std::vector<double> segflat;
+    int nseg = 0;
+    if (as_segments(sobj, segflat, &nseg) != 0)
         return NULL;
-    }
-    if (PyArray_NDIM(pa) != 2 || PyArray_DIM(pa, 1) != 2) {
-        Py_DECREF(pa); Py_DECREF(ta);
-        PyErr_SetString(PyExc_ValueError, "p must have shape (N, 2)");
+
+    PyArrayObject* ta = (PyArrayObject*)PyArray_FROM_OTF(tobj, NPY_FLOAT64, NPY_ARRAY_IN_ARRAY);
+    if (!ta) {
+        PyErr_SetString(PyExc_TypeError, "t must be array-like float64");
         return NULL;
     }
     if (PyArray_NDIM(ta) != 2 || PyArray_DIM(ta, 0) != 3 || PyArray_DIM(ta, 1) != 2) {
-        Py_DECREF(pa); Py_DECREF(ta);
+        Py_DECREF(ta);
         PyErr_SetString(PyExc_ValueError, "t must have shape (3, 2)");
         return NULL;
     }
-
-    const int n = (int)PyArray_DIM(pa, 0);
-    const double* pxy = (const double*)PyArray_DATA(pa);
     const double* txy = (const double*)PyArray_DATA(ta);
-
-    // Copies if the array is not C-contiguous row-major — FROM_OTF IN_ARRAY
-    // already made a C-contiguous copy if needed.
-    TDResult R = tridecomp_from_xy(pxy, n, txy, verbose != 0);
-    Py_DECREF(pa);
+    const double* sxy = nseg ? segflat.data() : nullptr;
+    TDTessellation R = tessellate_from_xy(sxy, nseg, txy, start ? start : "", verbose != 0);
     Py_DECREF(ta);
-    return result_to_dict(R);
+    return events_to_list(R);
 }
 
 static PyMethodDef methods[] = {
-    { "tridecomp", (PyCFunction)py_tridecomp, METH_VARARGS | METH_KEYWORDS,
-      "tridecomp(p, t, verbose=False) — EPEC C++ engine" },
+    { "tessellate", (PyCFunction)py_tessellate, METH_VARARGS | METH_KEYWORDS,
+      "tessellate(segments, t, start='', verbose=False) — EPEC C++ engine" },
     { NULL, NULL, 0, NULL }
 };
 
 static struct PyModuleDef moduledef = {
     PyModuleDef_HEAD_INIT,
     "tridecomp._cpp",
-    "CGAL EPEC triangular decomposition",
+    "CGAL EPEC tessellate(segments, t)",
     -1,
     methods
 };

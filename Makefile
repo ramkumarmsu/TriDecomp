@@ -35,13 +35,20 @@ PY_EXT  = $(shell $(PY) -c "import sysconfig; print(sysconfig.get_config_var('EX
 PY_LIBDIR = $(shell $(PY) -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
 PY_LDLIB  = $(shell $(PY) -c "import sys; print('python%d.%d' % sys.version_info[:2])")
 
+# Library engine is tessellate.cpp (CGAL + GMP/MPFR only; no shapelib).
+ifeq ($(SYSTEM_CGAL),)
+  PY_LIBS = $(LIBDIR)/libmpfr.a $(LIBDIR)/libgmp.a
+else
+  PY_LIBS = -lgmp -lmpfr
+endif
+
 python: python/tridecomp/_cpp$(PY_EXT)
 
-python/tridecomp/_cpp$(PY_EXT): TriDecomp.cpp python/tridecomp/_cpp.cpp tridecomp_api.h
-	$(CXX) -shared -fPIC $(CXXFLAGS) -DTRIDECOMP_NO_MAIN \
+python/tridecomp/_cpp$(PY_EXT): tessellate.cpp python/tridecomp/_cpp.cpp tridecomp_api.h
+	$(CXX) -shared -fPIC $(CXXFLAGS) \
 	    $(INCFLAGS) $(PY_INCS) -I. \
-	    -o $@ python/tridecomp/_cpp.cpp TriDecomp.cpp \
-	    $(LDFLAGS) $(LIBS) -L$(PY_LIBDIR) -l$(PY_LDLIB)
+	    -o $@ python/tridecomp/_cpp.cpp tessellate.cpp \
+	    $(LDFLAGS) $(PY_LIBS) -L$(PY_LIBDIR) -l$(PY_LDLIB)
 
 # Download and extract Ubuntu packages into $(LOCAL_PREFIX) (no root required).
 deps:

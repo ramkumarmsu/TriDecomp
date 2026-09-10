@@ -120,7 +120,6 @@
 #include <cstdint>
 #include <CGAL/Vector_2.h>
 #include <shapefil.h>
-#include "tridecomp_api.h"
 
 // Portable directory operations for multi-state batch mode.
 #ifdef _WIN32
@@ -863,17 +862,6 @@ static bool g_evaluation_terminated = false;
 // TRANSACTION TRACKING STRUCTURES
 // =========================================================================
 
-// Structure to record a triangle split
-struct TriangleSplitRecord {
-    int split_id;
-    Triangle parent_triangle;
-    Triangle child1;
-    Triangle child2;
-    Edge split_line;
-    int iteration;
-    bool is_lookahead;  // true = lookahead split, false = greedy fallback
-};
-
 // Structure to record a boundary line split
 struct LineSplitRecord {
     int split_id;
@@ -883,6 +871,25 @@ struct LineSplitRecord {
     Edge segment2;
     int triangle_split_id;  // Which triangle split caused this
     int iteration;
+};
+
+// Structure to record a triangle split
+struct TriangleSplitRecord {
+    int split_id;
+    std::string id;     // tree address of the parent ("" = enclosing triangle)
+    Triangle parent_triangle;
+    Triangle child1;    // left of directed cut  (bit 0)
+    Triangle child2;    // right of directed cut (bit 1)
+    Edge split_line;
+    int iteration;
+    bool is_lookahead;  // true = lookahead split, false = greedy fallback
+    std::vector<LineSplitRecord> line_splits;  // nested: caused by this cut
+};
+
+struct WorkItem {
+    Triangle tri;
+    std::vector<Edge> edges;
+    std::string addr;
 };
 
 // Global tracking for transactions
@@ -1185,6 +1192,12 @@ static void record_line_split_if_needed(
     }
 }
 
+static bool edge_lies_on_cut(const Edge& edge, const Edge& split_line)
+{
+    if (point_eq(edge.source(), edge.target())) return false;
+    return split_line.has_on(edge.source()) && split_line.has_on(edge.target());
+}
+
 static std::pair<std::vector<Edge>, std::vector<Edge>> assign_edges_impl(
     const std::array<Triangle, 2>& child_tris,
     const std::vector<Edge>& edges,
@@ -1202,6 +1215,14 @@ static std::pair<std::vector<Edge>, std::vector<Edge>> assign_edges_impl(
     Line cut_line = split_line.supporting_line();
 
     for (const auto& edge : edges) {
+        // Cut contains both endpoints: the constraint is a (possibly proper)
+        // subsegment of the new shared side. It belongs to both children.
+        if (edge_lies_on_cut(edge, split_line)) {
+            child_edges[0].push_back(edge);
+            child_edges[1].push_back(edge);
+            continue;
+        }
+
         if (!edge_may_meet_cut(cut_line, edge)) {
             place_edge_in_child(edge, ct, child_edges);
             continue;
@@ -1224,7 +1245,8 @@ static std::pair<std::vector<Edge>, std::vector<Edge>> assign_edges_impl(
             if (seg1_valid) place_edge_in_child(seg1, ct, child_edges);
             if (seg2_valid) place_edge_in_child(seg2, ct, child_edges);
         } else if (CGAL::object_cast<Edge>(&intersection_obj)) {
-            place_edge_in_child(edge, ct, child_edges);
+            child_edges[0].push_back(edge);
+            child_edges[1].push_back(edge);
         }
     }
     return { child_edges[0], child_edges[1] };
@@ -2497,16 +2519,62 @@ MarkResult mark_triangles_perwalk(const std::vector<Triangle>& leaves,
     return R;
 }
 
+// Left of the directed cut = CGAL ON_POSITIVE_SIDE of the supporting line.
+static void order_children_left_right(const Edge& cut, Triangle& left, Triangle& right)
+{
+    Line L = cut.supporting_line();
+    Point m = CGAL::centroid(left[0], left[1], left[2]);
+    if (L.oriented_side(m) == CGAL::ON_NEGATIVE_SIDE)
+        std::swap(left, right);
+}
+
+// Record a split (tree address, L/R children, nested line splits) and enqueue kids.
+static std::vector<LineSplitRecord> commit_triangle_split(
+    const Triangle& parent,
+    const std::string& addr,
+    std::array<Triangle, 2> kids,
+    const Edge& split_line,
+    const std::vector<Edge>& current_edges,
+    int iteration,
+    bool is_lookahead,
+    std::queue<WorkItem>& queue)
+{
+    order_children_left_right(split_line, kids[0], kids[1]);
+    g_triangle_split_count++;
+    TriangleSplitRecord rec;
+    rec.split_id = g_triangle_split_count;
+    rec.id = addr;
+    rec.parent_triangle = parent;
+    rec.child1 = kids[0];
+    rec.child2 = kids[1];
+    rec.split_line = split_line;
+    rec.iteration = iteration;
+    rec.is_lookahead = is_lookahead;
+
+    std::vector<LineSplitRecord> ls;
+    auto assigned = assign_edges_to_children_tracked(
+        kids, current_edges, split_line, rec.split_id, iteration, ls);
+    rec.line_splits = ls;
+    g_triangle_splits.push_back(rec);
+
+    if (area2d(kids[0]) > AREA_TOL)
+        queue.push(WorkItem{ kids[0], filter_degenerate_edges(assigned.first), addr + "0" });
+    if (area2d(kids[1]) > AREA_TOL)
+        queue.push(WorkItem{ kids[1], filter_degenerate_edges(assigned.second), addr + "1" });
+    return ls;
+}
+
 void process(const Triangle& initial_triangle,
     const std::vector<Edge>& polygon_edges,
     const Polygon& polygon,
     std::ofstream& debug_fp,
-    std::vector<FinalTriangle>& inside_triangles)
+    std::vector<FinalTriangle>& inside_triangles,
+    const std::string& start_addr = std::string())
 {
     std::vector<Triangle> all_triangles;
-    std::queue<std::pair<Triangle, std::vector<Edge>>> queue;
+    std::queue<WorkItem> queue;
 
-    queue.push({ initial_triangle, polygon_edges });
+    queue.push({ initial_triangle, polygon_edges, start_addr });
     int iteration = 0;
     // Scale iteration limit to polygon complexity: need ~2.5N splits minimum,
     // plus leaves, so total iterations ~5N.  Use 10N as a safe upper bound.
@@ -2534,8 +2602,11 @@ void process(const Triangle& initial_triangle,
     g_transaction_log << "==============================================\n\n";
 
     while (!queue.empty() && iteration < max_iter) {
-        auto [tri, edges] = queue.front();
+        WorkItem item = queue.front();
         queue.pop();
+        const Triangle tri = item.tri;
+        const std::vector<Edge> edges = std::move(item.edges);
+        const std::string addr = std::move(item.addr);
         iteration++;
         cells_processed++;
 
@@ -2601,45 +2672,22 @@ void process(const Triangle& initial_triangle,
         if (best.found) {
             split_tris = best.child_triangles;
             split_line = best.split_line;
-            
-            // Record the triangle split
-            g_triangle_split_count++;
-            TriangleSplitRecord tri_record;
-            tri_record.split_id = g_triangle_split_count;
-            tri_record.parent_triangle = tri;
-            tri_record.child1 = split_tris[0];
-            tri_record.child2 = split_tris[1];
-            tri_record.split_line = split_line;
-            tri_record.iteration = iteration;
-            tri_record.is_lookahead = true;
-            g_triangle_splits.push_back(tri_record);
-            
-            // Log triangle split
+            std::vector<LineSplitRecord> line_splits_this_iteration = commit_triangle_split(
+                tri, addr, split_tris, split_line, current_edges, iteration, true, queue);
+            const TriangleSplitRecord& tri_record = g_triangle_splits.back();
+
             std::string priority_str = (best.priority == 0) ? "POLYGON_EDGE" :
                                        (best.priority == 1) ? "ZERO_CROSSING" : "BOUNDARY_CROSSING";
-            g_transaction_log << "TRIANGLE_SPLIT #" << tri_record.split_id << " (Lookahead, " << priority_str << ")\n";
+            g_transaction_log << "TRIANGLE_SPLIT #" << tri_record.split_id
+                              << " id=" << (tri_record.id.empty() ? "\"\"" : tri_record.id)
+                              << " (Lookahead, " << priority_str << ")\n";
             g_transaction_log << "  Iteration: " << iteration << "\n";
             g_transaction_log << "  Priority: " << best.priority << " (" << priority_str << ")\n";
             g_transaction_log << "  Parent: " << triangle_to_string(tri) << "\n";
             g_transaction_log << "  Split line: " << edge_to_string(split_line) << "\n";
-            g_transaction_log << "  Child 1: " << triangle_to_string(split_tris[0]) << "\n";
-            g_transaction_log << "  Child 2: " << triangle_to_string(split_tris[1]) << "\n";
+            g_transaction_log << "  Child 0 (L): " << triangle_to_string(tri_record.child1) << "\n";
+            g_transaction_log << "  Child 1 (R): " << triangle_to_string(tri_record.child2) << "\n";
             g_transaction_log << "  Estimated final leaves: " << best.min_leaves << "\n\n";
-            
-            // Use tracked version to capture line splits
-            std::vector<LineSplitRecord> line_splits_this_iteration;
-            auto [child_edges1, child_edges2] = assign_edges_to_children_tracked(
-                split_tris, current_edges, split_line, 
-                g_triangle_split_count, iteration, line_splits_this_iteration);
-
-            if (area2d(split_tris[0]) > AREA_TOL) {
-                // Children of a split are independent and can be processed in
-                // parallel; the current queue is sequential (see notes in chat).
-                queue.push({ split_tris[0], filter_degenerate_edges(child_edges1) });
-            }
-            if (area2d(split_tris[1]) > AREA_TOL) {
-                queue.push({ split_tris[1], filter_degenerate_edges(child_edges2) });
-            }
             
             splits_performed++;
             if (best.priority == 0) poly_edge_splits++;
@@ -2681,38 +2729,18 @@ void process(const Triangle& initial_triangle,
         }
         else {
             if (slope_split_greedy(tri, current_edges, current_edges, split_tris, split_line)) {
-                // Record the triangle split (greedy)
-                g_triangle_split_count++;
-                TriangleSplitRecord tri_record;
-                tri_record.split_id = g_triangle_split_count;
-                tri_record.parent_triangle = tri;
-                tri_record.child1 = split_tris[0];
-                tri_record.child2 = split_tris[1];
-                tri_record.split_line = split_line;
-                tri_record.iteration = iteration;
-                tri_record.is_lookahead = false;
-                g_triangle_splits.push_back(tri_record);
-                
-                // Log triangle split
-                g_transaction_log << "TRIANGLE_SPLIT #" << tri_record.split_id << " (Greedy Fallback)\n";
+                std::vector<LineSplitRecord> line_splits_this_iteration = commit_triangle_split(
+                    tri, addr, split_tris, split_line, current_edges, iteration, false, queue);
+                const TriangleSplitRecord& tri_record = g_triangle_splits.back();
+
+                g_transaction_log << "TRIANGLE_SPLIT #" << tri_record.split_id
+                                  << " id=" << (tri_record.id.empty() ? "\"\"" : tri_record.id)
+                                  << " (Greedy Fallback)\n";
                 g_transaction_log << "  Iteration: " << iteration << "\n";
                 g_transaction_log << "  Parent: " << triangle_to_string(tri) << "\n";
                 g_transaction_log << "  Split line: " << edge_to_string(split_line) << "\n";
-                g_transaction_log << "  Child 1: " << triangle_to_string(split_tris[0]) << "\n";
-                g_transaction_log << "  Child 2: " << triangle_to_string(split_tris[1]) << "\n\n";
-                
-                // Use tracked version to capture line splits
-                std::vector<LineSplitRecord> line_splits_this_iteration;
-                auto [child_edges1, child_edges2] = assign_edges_to_children_tracked(
-                    split_tris, current_edges, split_line,
-                    g_triangle_split_count, iteration, line_splits_this_iteration);
-
-                if (area2d(split_tris[0]) > AREA_TOL) {
-                    queue.push({ split_tris[0], filter_degenerate_edges(child_edges1) });
-                }
-                if (area2d(split_tris[1]) > AREA_TOL) {
-                    queue.push({ split_tris[1], filter_degenerate_edges(child_edges2) });
-                }
+                g_transaction_log << "  Child 0 (L): " << triangle_to_string(tri_record.child1) << "\n";
+                g_transaction_log << "  Child 1 (R): " << triangle_to_string(tri_record.child2) << "\n\n";
                 splits_performed++;
                 greedy_fallbacks++;
                 // Determine greedy split priority
@@ -2785,8 +2813,9 @@ void process(const Triangle& initial_triangle,
         g_transaction_log << "\n[WARNING] Iteration limit reached. "
                          << queue.size() << " triangles unresolved.\n\n";
         while (!queue.empty()) {
-            auto [tri_q, edges_q] = queue.front();
+            WorkItem leftover = queue.front();
             queue.pop();
+            const Triangle& tri_q = leftover.tri;
             if (area2d(tri_q) > AREA_TOL) {
                 all_triangles.push_back(tri_q);
                 unresolved_leaves++;
@@ -4526,239 +4555,6 @@ static int run_one_state(const StateConfig& cfg, StateSummary& sum) {
     sum.ags_txns        = total_txns;
     sum.ok              = true;
     return 0;
-}
-
-// =========================================================================
-// Python / in-memory API: polygon + enclosing triangle, no shapefile, no files.
-// =========================================================================
-static void td_xy(const Point& p, double o[2]) {
-    o[0] = CGAL::to_double(p.x());
-    o[1] = CGAL::to_double(p.y());
-}
-
-static void td_fill_tri(const Triangle& tri, TDTri& out) {
-    for (int i = 0; i < 3; ++i) td_xy(tri[i], out.v[i]);
-}
-
-static void td_fill_edge(const Edge& e, TDEdge& out) {
-    td_xy(e.source(), out.a);
-    td_xy(e.target(), out.b);
-}
-
-static const char* td_region_name(int code) {
-    if (code == REGION_INSIDE) return "INSIDE";
-    if (code == REGION_OUTSIDE) return "OUTSIDE";
-    return "BOUNDARY";
-}
-
-TDResult tridecomp_from_xy(const double* p_xy, int n,
-                           const double* t_xy, bool verbose)
-{
-    TDResult R;
-    if (!p_xy || !t_xy || n < 3) {
-        R.error = "p must have at least 3 vertices and t must be a (3,2) triangle";
-        return R;
-    }
-
-    reset_pipeline_globals();
-    G_VERBOSITY = verbose ? 1 : 0;
-    QUANTIZE_TRANSACTIONS = true;
-    USE_ANGLE_METHOD = true;
-    LOOKAHEAD_DEPTH_LIMIT = 0;
-
-    std::vector<Point> pts;
-    pts.reserve(n);
-    for (int i = 0; i < n; ++i)
-        pts.emplace_back(p_xy[2 * i], p_xy[2 * i + 1]);
-    if (pts.size() >= 2 && point_eq(pts.front(), pts.back()))
-        pts.pop_back();
-    if (pts.size() < 3) {
-        R.error = "p has fewer than 3 vertices after dropping the closing point";
-        return R;
-    }
-
-    Polygon polygon(pts.begin(), pts.end());
-    if (!polygon.is_simple()) {
-        R.error = "polygon is not simple";
-        return R;
-    }
-    if (polygon.is_clockwise_oriented()) {
-        polygon.reverse_orientation();
-        pts.assign(polygon.vertices_begin(), polygon.vertices_end());
-    }
-
-    std::vector<Edge> polygon_edges;
-    polygon_edges.reserve(pts.size());
-    for (size_t i = 0; i < pts.size(); ++i)
-        polygon_edges.emplace_back(pts[i], pts[(i + 1) % pts.size()]);
-
-    Point tv[3] = {
-        Point(t_xy[0], t_xy[1]),
-        Point(t_xy[2], t_xy[3]),
-        Point(t_xy[4], t_xy[5])
-    };
-    double signed_area = CGAL::to_double(Triangle_cgal(tv[0], tv[1], tv[2]).area());
-    if (std::abs(signed_area) <= AREA_TOL) {
-        R.error = "enclosing triangle has near-zero area";
-        return R;
-    }
-    if (signed_area < 0.0)
-        std::swap(tv[1], tv[2]);
-    Triangle initial = { tv[0], tv[1], tv[2] };
-
-#ifdef _WIN32
-    const char* kNull = "nul";
-#else
-    const char* kNull = "/dev/null";
-#endif
-    g_transaction_log.open(kNull);
-    g_decision_log.open(kNull);
-    std::ofstream debug_fp(kNull);
-
-    std::streambuf* cout_old = nullptr;
-    std::streambuf* cerr_old = nullptr;
-    std::ofstream null_out;
-    if (!verbose) {
-        null_out.open(kNull);
-        cout_old = std::cout.rdbuf(null_out.rdbuf());
-        cerr_old = std::cerr.rdbuf(null_out.rdbuf());
-    }
-
-    compute_dynamic_limits(static_cast<int>(polygon_edges.size()));
-    std::vector<FinalTriangle> inside_triangles;
-    process(initial, polygon_edges, polygon, debug_fp, inside_triangles);
-
-    if (!verbose) {
-        std::cout.rdbuf(cout_old);
-        std::cerr.rdbuf(cerr_old);
-    }
-
-    R.triangle_splits.reserve(g_triangle_splits.size());
-    for (const auto& rec : g_triangle_splits) {
-        TDSplit s;
-        s.split_id = rec.split_id;
-        s.iteration = rec.iteration;
-        s.is_lookahead = rec.is_lookahead ? 1 : 0;
-        td_fill_tri(rec.parent_triangle, s.parent);
-        td_fill_tri(rec.child1, s.child1);
-        td_fill_tri(rec.child2, s.child2);
-        td_fill_edge(rec.split_line, s.split_line);
-        R.triangle_splits.push_back(s);
-    }
-
-    R.line_splits.reserve(g_line_splits.size());
-    for (const auto& rec : g_line_splits) {
-        TDLineSplit s;
-        s.split_id = rec.split_id;
-        s.triangle_split_id = rec.triangle_split_id;
-        s.iteration = rec.iteration;
-        td_fill_edge(rec.original_edge, s.original_edge);
-        td_fill_edge(rec.segment1, s.segment1);
-        td_fill_edge(rec.segment2, s.segment2);
-        td_xy(rec.split_point, s.split_point);
-        QPoint qp = quantize(rec.split_point);
-        s.qx = (std::int64_t)qp.X;
-        s.qy = (std::int64_t)qp.Y;
-        R.line_splits.push_back(s);
-    }
-
-    R.marks.reserve(g_leaf_triangles.size());
-    for (size_t i = 0; i < g_leaf_triangles.size(); ++i) {
-        const Triangle& tri = g_leaf_triangles[i];
-        int rc = (i < g_leaf_region_codes.size()) ? g_leaf_region_codes[i] : REGION_BOUNDARY;
-        TDMark m;
-        m.leaf_id = (int)i + 1;
-        m.region_code = rc;
-        m.region = td_region_name(rc);
-        td_fill_tri(tri, m.vertices);
-        m.area = area2d(tri);
-        QPoint q0 = quantize(tri[0]), q1 = quantize(tri[1]), q2 = quantize(tri[2]);
-        m.qv[0][0] = q0.X; m.qv[0][1] = q0.Y;
-        m.qv[1][0] = q1.X; m.qv[1][1] = q1.Y;
-        m.qv[2][0] = q2.X; m.qv[2][1] = q2.Y;
-        R.marks.push_back(m);
-    }
-
-    // Rebuild quantized walk (same construction as emit_quantized_walkable_transactions).
-    std::vector<double> lsx(g_line_splits.size()), lsy(g_line_splits.size());
-    for (size_t k = 0; k < g_line_splits.size(); ++k) {
-        lsx[k] = CGAL::to_double(g_line_splits[k].split_point.x());
-        lsy[k] = CGAL::to_double(g_line_splits[k].split_point.y());
-    }
-    const double BB_EPS = 1e-9;
-    int seq = 0;
-    std::vector<std::array<QPoint, 2>> qwalk;
-    qwalk.reserve(polygon_edges.size() + g_line_splits.size());
-    for (const auto& E : polygon_edges) {
-        const Point& A = E.source();
-        const Point& B = E.target();
-        K::Vector_2 dir = B - A;
-        K::FT dlen2 = dir * dir;
-        double Ax = CGAL::to_double(A.x()), Ay = CGAL::to_double(A.y());
-        double Bx = CGAL::to_double(B.x()), By = CGAL::to_double(B.y());
-        double minx = std::min(Ax, Bx) - BB_EPS, maxx = std::max(Ax, Bx) + BB_EPS;
-        double miny = std::min(Ay, By) - BB_EPS, maxy = std::max(Ay, By) + BB_EPS;
-        struct OnEdge { Point p; K::FT t; };
-        std::vector<OnEdge> mids;
-        if (dlen2 != K::FT(0)) {
-            for (size_t k = 0; k < g_line_splits.size(); ++k) {
-                if (lsx[k] < minx || lsx[k] > maxx || lsy[k] < miny || lsy[k] > maxy)
-                    continue;
-                const Point& P = g_line_splits[k].split_point;
-                if (!CGAL::collinear(A, B, P)) continue;
-                K::FT t = ((P - A) * dir) / dlen2;
-                if (t > K::FT(0) && t < K::FT(1)) {
-                    bool dup = false;
-                    for (const auto& m : mids) if (m.p == P) { dup = true; break; }
-                    if (!dup) mids.push_back({ P, t });
-                }
-            }
-        }
-        std::sort(mids.begin(), mids.end(),
-                  [](const OnEdge& a, const OnEdge& b){ return a.t < b.t; });
-        Point prev = A;
-        auto emit_seg = [&](const Point& s, const Point& tt) {
-            QPoint qs = quantize(s), qt = quantize(tt);
-            qwalk.push_back({ qs, qt });
-            TDWalkSeg w;
-            w.seq = seq++;
-            w.sx = CGAL::to_double(s.x());  w.sy = CGAL::to_double(s.y());
-            w.tx = CGAL::to_double(tt.x()); w.ty = CGAL::to_double(tt.y());
-            w.qsx = qs.X; w.qsy = qs.Y; w.qtx = qt.X; w.qty = qt.Y;
-            R.walk.push_back(w);
-        };
-        for (const auto& m : mids) { emit_seg(prev, m.p); prev = m.p; }
-        emit_seg(prev, B);
-    }
-
-    bool connected = true;
-    for (size_t i = 0; i + 1 < qwalk.size(); ++i) {
-        if (qwalk[i][1].X != qwalk[i + 1][0].X || qwalk[i][1].Y != qwalk[i + 1][0].Y) {
-            connected = false; break;
-        }
-    }
-    bool closed = false;
-    if (!qwalk.empty())
-        closed = (qwalk.back()[1].X == qwalk.front()[0].X &&
-                  qwalk.back()[1].Y == qwalk.front()[0].Y);
-
-    R.stats.n_polygon = (int)pts.size();
-    R.stats.n_splits = (int)R.triangle_splits.size();
-    R.stats.n_line_splits = (int)R.line_splits.size();
-    R.stats.n_leaves = (int)R.marks.size();
-    R.stats.n_interior = g_last_mark.inside_count;
-    R.stats.n_exterior = g_last_mark.outside_count;
-    R.stats.perwalk_seeds = g_last_mark.perwalk_inside_seeds;
-    R.stats.flood_added = g_last_mark.flood_added;
-    R.stats.flood_unreached = g_last_mark.flood_unreached;
-    R.stats.inside_area = g_last_mark.inside_area;
-    R.stats.polygon_area = g_last_mark.polygon_area;
-    R.stats.area_ok = g_last_mark.area_ok;
-    R.stats.walkable = connected && closed && !qwalk.empty();
-
-    g_transaction_log.close();
-    g_decision_log.close();
-    return R;
 }
 
 #ifndef TRIDECOMP_NO_MAIN

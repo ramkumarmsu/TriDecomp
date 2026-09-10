@@ -1,53 +1,140 @@
-# TriDecomp Pipeline
+# TriDecomp
 
-**Shapefile → (optional) Polygon Reduction → CGAL Header Generation → Triangular Decomposition → PerWalk + MarkTriangles Classification → Fixed-Point Quantization → Walkable Boundary + Transaction Logging**
+Triangular decomposition of constraint segments inside an enclosing triangle. The **C++ engine does one thing**: `tessellate(segments, t)`. Walk, marks, I/O, and enclosing-triangle helpers are Python.
 
-A single-file C++ pipeline that reads GIS TIGER/ESRI shapefiles, optionally simplifies polygon boundaries using the Ramer–Douglas–Peucker algorithm, generates CGAL-compatible header files, and performs slopeline-based triangular decomposition with full AGS (Authoritative GIS) transaction tracking. Split selection uses Dr. Ramkumar's **angle method** by default. At publishing time the pipeline snaps coordinates to a global integer grid and emits a single closed, **blockchain-walkable** boundary cycle.
+The same source still builds a **C++ CLI** that reads TIGER/ESRI shapefiles, optionally simplifies, decomposes, classifies leaves, and writes AGS transaction logs (see [C++ CLI](#c-cli-shapefile-pipeline)).
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Prerequisites](#prerequisites)
-3. [Building](#building)
-4. [Usage](#usage)
-5. [Split Selection: Angle Method vs. Legacy Lookahead](#split-selection-angle-method-vs-legacy-lookahead)
-6. [Pipeline Stages](#pipeline-stages)
-7. [Output Files](#output-files)
-8. [Reconstructing Transactions](#reconstructing-transactions)
-9. [State FIPS Reference](#state-fips-reference)
-10. [County FIPS Reference](#county-fips-reference)
-11. [Examples](#examples)
-12. [Troubleshooting](#troubleshooting)
+1. [Architecture](#architecture)
+2. [Python library](#python-library)
+3. [Prerequisites](#prerequisites)
+4. [Building](#building)
+5. [C++ CLI (shapefile pipeline)](#c-cli-shapefile-pipeline)
+6. [Split Selection: Angle Method vs. Legacy Lookahead](#split-selection-angle-method-vs-legacy-lookahead)
+7. [Pipeline Stages](#pipeline-stages)
+8. [Output Files](#output-files)
+9. [Reconstructing Transactions](#reconstructing-transactions)
+10. [State FIPS Reference](#state-fips-reference)
+11. [County FIPS Reference](#county-fips-reference)
+12. [Examples](#examples)
+13. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Overview
+## Architecture
 
-This tool combines several workflows into a single executable:
+| Layer | Language | Role |
+|---|---|---|
+| **`tessellate(segments, t, start="")`** | C++ `tessellate.cpp` (CGAL **EPEC**) | Split `t` against untyped constraint segments. Returns a list of `SplitEvent`s with tree addresses and nested line splits. |
+| **`tessellate(..., engine="python")`** | Python (CGAL **EPIC**) | Same contract; A/B stand-in, not the chain-fidelity path. |
+| **`edges_of`, `tridecomp`, `walk`, `tiles`, `gettri`, `read_tiger_polygon`** | Python | Polygon sugar, PerWalk marks, enclosing triangle, shapefile I/O. |
 
-1. **Shapefile Processing**: Reads `.shp` files (U.S. Census TIGER or any ESRI shapefile), filters by state and/or county FIPS, and optionally reduces vertex count using Douglas-Peucker simplification.
+A polygon ring is just one source of segments. Delegation / refinement is the same primitive with extra segments and a non-empty `start` code.
 
-2. **Triangular Decomposition**: Takes the polygon, computes a minimum enclosing triangle, and recursively splits it using slopeline-based cuts. Every split is tracked as an AGS protocol transaction.
+**Invariants of a split**
 
-3. **Fixed-Point Quantization + Walkable Publishing**: All geometry is computed in CGAL's exact kernel; only when publishing transactions are coordinates snapped to a global integer grid. The fully-subdivided boundary is rebuilt and verified as a single closed, connected cycle a chain verifier can walk end to end.
+- The two children partition the parent (disjoint interiors, union = parent).
+- From the directed cut, **`0` = left child**, **`1` = right child**.
+- A cut that **crosses** a constraint interior splits it; one stub goes to each child (a `line_splits` record).
+- A cut that **contains both endpoints** of a constraint (the segment lies on the new shared side, possibly as a proper subsegment / T-junction) copies that segment into **both** children. No new vertex, no line-split record.
 
-The tool replaces the need for pre-built polygon header files (`texas_boundary.h`, `yazoo_boundary.h`, etc.). Instead, you point it at a shapefile, optionally specify a reduction percentage, and it generates the header files and runs the full triangulation in one step.
+---
 
-### Key Features
+## Python library
 
-- **Shapelib-based reader** — lightweight, no GDAL dependency required
-- **State + County FIPS filtering** — extract a single state or a single county from a national shapefile
-- **County discovery with vertex ranking** — `--list-counties` ranks counties by polygon vertex count so you can pick the lightest ones for fast iteration
-- **Optional Douglas-Peucker reduction** — percentage-based vertex reduction that preserves polygon shape far better than every-Nth-point decimation; omit it entirely for full-resolution runs
-- **Angle-method split selection** — Dr. Ramkumar's angle-projection heuristic chooses cuts in O(k log k) per triangle (legacy recursive lookahead still selectable for A/B comparison)
-- **Closed polygon detection** — automatically handles rings where the first and last points are identical
-- **CGAL header generation** — output files are directly `#include`-able in other CGAL programs
-- **Fixed-point quantization** — global integer coordinate system (~1 cm resolution) applied only at publishing time
-- **Walkable boundary** — published boundary verified as a single closed integer cycle (PerWalk-ready)
-- **Interior/exterior marking** — every leaf triangle classified via the verifiable PerWalk + MarkTriangles protocol (boundary walk + interior flood), cross-checked against an independent point-in-polygon oracle and an area-completeness test
-- **Transaction logging** — every triangle split and boundary line split is recorded with full geometry for post-hoc reconstruction
+### Install
+
+From the repo root, after [building](#building) the extension:
+
+```bash
+make python
+pip install -e . --no-build-isolation --no-deps
+```
+
+Import is then `from tridecomp import ...` (editable package under `python/tridecomp/`).
+
+### Segments: shape `(M, 2, 2)`
+
+Each row is one constraint edge — **two endpoints**, each `(x, y)`:
+
+```
+segments[i] = [[x0, y0],     # endpoint A
+               [x1, y1]]     # endpoint B
+```
+
+That is the same four numbers, row-major, as shape `(M, 4)`: `x0, y0, x1, y1`. Tessellation treats the edge as undirected. Cycle **direction** matters later in `walk`, not here.
+
+`edges_of(p)` builds this from a closed ring `p` of shape `(N, 2)` (CCW; a repeated closing vertex is dropped): `segments[i]` runs from `p[i]` to `p[i+1]`.
+
+### `tessellate(segments, t, start="")`
+
+```python
+from tridecomp import tessellate, tridecomp, edges_of, gettri, walk, tiles
+from tridecomp import read_tiger_polygon
+
+p = read_tiger_polygon("tl_2025_us_county.zip", state="31", county="039")
+t = gettri(p, rat=1.5)
+events = tessellate(edges_of(p), t)          # or tridecomp(p, t)
+# events = tessellate(edges_of(p), t, engine="python")  # EPIC stand-in
+```
+
+- **`t`**: shape `(3, 2)`. Clockwise input is reversed to CCW.
+- **`start`**: tree address of `t`. Empty (`""`) for a fresh enclosing triangle. Pass a leaf code (e.g. `"01011"`) to split that tile further after adding segments inside it; child ids are `start+"0"` / `start+"1"`.
+- **`engine`**: `"cpp"` (default, EPEC) or `"python"` (EPIC).
+
+Each **SplitEvent** is a dict:
+
+| Key | Meaning |
+|---|---|
+| `id` | Bitstring of the parent (`""` is the original enclosing triangle, or `start` on a refinement). |
+| `child0` / `child1` | `id+"0"` (left of the cut) and `id+"1"` (right). |
+| `parent` | `(3, 2)` triangle being split. |
+| `cut` | `(2, 2)` split segment on the parent. |
+| `child` | `(left, right)` child triangles, each `(3, 2)`. |
+| `line_splits` | Nested list: constraint edges this cut **crossed** (new vertex). Each has `edge` `(2, 2)`, `point` `(2,)`, `seg` (two stubs). |
+
+Leaves are implied: a triangle that never appears later as a `parent`. Replay with `tiles(events, t, start="")` → `{id: triangle}`.
+
+### Refinement
+
+```python
+leaf_id = "01011"
+leaf_tri = tiles(events, t)[leaf_id]
+more = tessellate(extra_segments, leaf_tri, start=leaf_id)
+all_events = events + more
+leaves = tiles(all_events, t)          # original tree; that leaf is replaced
+```
+
+### `walk(events, t, cycle)`
+
+Walks a directed cycle on the constraint complex (typically the same ring you tessellated).
+
+- Tile to the **left** of each cycle edge → `INSIDE` (only if unmarked).
+- Tile to the **right** → `OUTSIDE` (only if unmarked).
+- Marks are **monotonic**: `UNMARKED → INSIDE/OUTSIDE` or unchanged. `INSIDE ↔ OUTSIDE` is a crossing; `simple` is then `False`.
+- Remaining unmarked tiles flood from those seeds without toggling.
+
+```python
+from tridecomp import UNMARKED, INSIDE, OUTSIDE
+
+w = walk(events, t, p)
+w["simple"]       # True if the cycle did not cross itself relative to the tessellation
+w["marks"]        # id -> UNMARKED / INSIDE / OUTSIDE
+w["n_inside"], w["n_outside"]
+```
+
+The cycle edges must lie on the complex after line splits, so `tessellate` must have been given those segments if you want to certify the cycle.
+
+### Helpers
+
+| Function | Purpose |
+|---|---|
+| `tridecomp(p, t, start="")` | `tessellate(edges_of(p), t, start=start)` |
+| `gettri(p, rat=1.5)` | Enclosing triangle `(3, 2)` for vertices `p` |
+| `read_tiger_polygon(path, state=, county=)` | Exterior ring from a TIGER shapefile or zip (resolves relative names against cwd and the repo root) |
 
 ---
 
@@ -57,8 +144,11 @@ The tool replaces the need for pre-built polygon header files (`texas_boundary.h
 |---|---|---|---|
 | C++17 compiler | Build | Visual Studio 2022 | `g++` (13+) |
 | CGAL | Exact geometry kernel | `vcpkg install cgal:x64-windows` | `libcgal-dev` (5.6) |
-| shapelib | Shapefile reader | `vcpkg install shapelib:x64-windows` | `libshp-dev` |
+| shapelib | Shapefile reader (CLI) | `vcpkg install shapelib:x64-windows` | `libshp-dev` |
 | GMP / MPFR | CGAL exact numbers | pulled in by vcpkg | `libgmp-dev` `libmpfr-dev` |
+| Python ≥ 3.10 + numpy | Library | | conda/pip |
+| CGAL Python (optional) | `engine="python"` EPIC | | conda-forge `cgal-cpp` / `import CGAL` |
+| pyogrio (optional) | `read_tiger_polygon` | | conda/pip |
 
 If you haven't set up vcpkg yet:
 
@@ -91,7 +181,16 @@ Keep all companion files (`.shp`, `.dbf`, `.shx`) in the same folder. The tool r
 
 ## Building
 
-### Visual Studio 2022
+### Python extension (`make python`)
+
+Builds `python/tridecomp/_cpp*.so` from `tessellate.cpp` (CGAL EPEC + GMP/MPFR; no shapelib). Default interpreter is `$HOME/miniconda3/envs/tridecomp-py/bin/python` (`PY=...` to override). The shapefile CLI is a separate binary (`make` / `TriDecomp.cpp`).
+
+```bash
+make python
+pip install -e . --no-build-isolation --no-deps
+```
+
+### Visual Studio 2022 (CLI)
 
 1. Double-click `TriDecomp.sln`
 2. Set the configuration to **Release | x64** (toolbar dropdown)
@@ -129,7 +228,7 @@ make
 
 The Makefile prefers `/usr/include/CGAL` when present; otherwise it uses the local prefix and statically links shapelib, GMP, and MPFR so you do not need `LD_LIBRARY_PATH`.
 
-Smoke-test with a synthetic 4-vertex square:
+Smoke-test the CLI with a synthetic 4-vertex square:
 
 ```bash
 make test
@@ -143,7 +242,13 @@ Then run against a real shapefile the same way as on Windows, substituting `./Tr
 
 ---
 
-## Usage
+## C++ CLI (shapefile pipeline)
+
+**Shapefile → (optional) Polygon Reduction → CGAL Header Generation → Triangular Decomposition → PerWalk + MarkTriangles Classification → Fixed-Point Quantization → Walkable Boundary + Transaction Logging**
+
+The CLI still runs the full AGS logging path in-process (marks, quantization, CSVs). The **library** path does not: `tessellate` returns only split events; `walk` is Python.
+
+### Usage
 
 ```
 TriDecomp.exe <shapefile.shp> [reduction_%] [options]
@@ -549,6 +654,30 @@ Always confirm with `--list-counties` for the specific shapefile year, since cod
 ---
 
 ## Examples
+
+### Python: county ring → tessellate → walk
+
+```python
+from tridecomp import (
+    tessellate, tridecomp, edges_of, gettri, walk, tiles,
+    read_tiger_polygon,
+)
+
+p = read_tiger_polygon("tl_2025_us_county.zip", state="31", county="039")
+t = gettri(p, rat=1.5)
+events = tridecomp(p, t)                    # tessellate(edges_of(p), t)
+leaves = tiles(events, t)
+w = walk(events, t, p)
+print(len(events), len(leaves), w["simple"], w["n_inside"])
+```
+
+### Python: refine a leaf with extra segments
+
+```python
+code = next(iter(leaves))
+more = tessellate(extra_segments, leaves[code], start=code)
+combined = events + more
+```
 
 ### Discover what's in a national shapefile
 

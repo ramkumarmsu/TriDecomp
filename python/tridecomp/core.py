@@ -1,4 +1,4 @@
-"""Core slopeline decomposition: ``tridecomp(p, t)``.
+"""EPIC stand-in for ``tessellate(segments, t)``.
 
 Ports the C++ greedy angle-method path (lookahead 0). Geometry constructions
 use the CGAL Python kernel; angle scoring stays in float64, as in C++.
@@ -162,6 +162,12 @@ def _place_edge_in_child(seg: Segment_2, ct, child_edges) -> None:
             return
 
 
+def _edge_lies_on_cut(edge: Segment_2, split_line: Segment_2) -> bool:
+    if _point_eq(edge.source(), edge.target()):
+        return False
+    return split_line.has_on(edge.source()) and split_line.has_on(edge.target())
+
+
 def _assign_edges(child_tris, edges, split_line: Segment_2, track: bool,
                   triangle_split_id: int, iteration: int, line_splits: list):
     child_edges = [[], []]
@@ -171,6 +177,10 @@ def _assign_edges(child_tris, edges, split_line: Segment_2, track: bool,
     )
     cut_line = split_line.supporting_line()
     for edge in edges:
+        if _edge_lies_on_cut(edge, split_line):
+            child_edges[0].append(edge)
+            child_edges[1].append(edge)
+            continue
         if not _edge_may_meet_cut(cut_line, edge):
             _place_edge_in_child(edge, ct, child_edges)
             continue
@@ -563,158 +573,93 @@ def _build_walk(polygon_edges, line_splits):
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API (EPIC stand-in for C++ tessellate)
 # ---------------------------------------------------------------------------
 
-def tridecomp(p: np.ndarray, t: np.ndarray, *, verbose: bool = False) -> dict:
-    """Decompose polygon ``p`` inside enclosing triangle ``t``.
+def _centroid_pt(tri) -> Point_2:
+    return Point_2(
+        (float(tri[0].x()) + float(tri[1].x()) + float(tri[2].x())) / 3.0,
+        (float(tri[0].y()) + float(tri[1].y()) + float(tri[2].y())) / 3.0,
+    )
 
-    Parameters
-    ----------
-    p : ndarray, shape (N, 2)
-        Simple polygon vertices in CCW order. A repeated closing vertex is dropped.
-    t : ndarray, shape (3, 2)
-        Triangle that contains ``p``. Clockwise input is reversed.
-    verbose : bool
-        If True, print progress to stderr.
 
-    Returns
-    -------
-    dict
-        ``triangle_splits``, ``line_splits``, ``marks``, ``walk``, ``stats``.
-    """
+def _order_children_left_right(split_line: Segment_2, t1, t2):
+    side = split_line.supporting_line().oriented_side(_centroid_pt(t1))
+    if side == ON_NEGATIVE_SIDE:
+        return t2, t1
+    return t1, t2
+
+
+def _prepare_segments(segments: np.ndarray) -> np.ndarray:
+    s = np.asarray(segments, dtype=np.float64)
+    if s.size == 0:
+        return np.zeros((0, 2, 2), dtype=np.float64)
+    if s.ndim == 2 and s.shape[1] == 4:
+        s = s.reshape(-1, 2, 2)
+    if s.ndim != 3 or s.shape[1:] != (2, 2):
+        raise ValueError(f"segments must have shape (M, 2, 2) or (M, 4), got {s.shape}")
+    keep = np.linalg.norm(s[:, 0] - s[:, 1], axis=1) > POINT_TOL
+    return s[keep]
+
+
+def tessellate(segments: np.ndarray, t: np.ndarray, *, start: str = "",
+               verbose: bool = False) -> list:
+    """Greedy angle-method tessellation using CGAL Python / EPIC."""
     import sys
+    from .geom import check_start
 
-    ring_xy = _prepare_polygon(p)
+    start = check_start(start)
+    segs_xy = _prepare_segments(segments)
     tri_xy = _prepare_triangle(t)
-    polygon_pts = [_pt(xy) for xy in ring_xy]
-    polygon_edges = [
-        Segment_2(polygon_pts[i], polygon_pts[(i + 1) % len(polygon_pts)])
-        for i in range(len(polygon_pts))
-    ]
+    constraint_edges = [Segment_2(_pt(s[0]), _pt(s[1])) for s in segs_xy]
     initial = (_pt(tri_xy[0]), _pt(tri_xy[1]), _pt(tri_xy[2]))
 
-    queue = deque([(initial, list(polygon_edges))])
-    max_iter = max(100_000, len(polygon_edges) * 10)
+    queue = deque([(initial, list(constraint_edges), start)])
+    max_iter = max(100_000, max(1, len(constraint_edges)) * 10)
     iteration = 0
-    all_triangles = []
-    triangle_splits = []
-    line_splits = []
+    events = []
 
     while queue and iteration < max_iter:
-        tri, edges = queue.popleft()
+        tri, edges, addr = queue.popleft()
         iteration += 1
         if verbose and (iteration == 1 or iteration % 100 == 0):
             print(f"[progress] iteration={iteration} queue={len(queue)} "
-                  f"leaves={len(all_triangles)} splits={len(triangle_splits)}",
-                  file=sys.stderr)
+                  f"splits={len(events)}", file=sys.stderr)
 
         current = _filter_degenerate(
             [e for e in edges if not _edge_on_triangle_side(e, tri)]
         )
         if not current:
-            all_triangles.append(tri)
             continue
 
         best = _find_best_split_angle(tri, current, current)
         if best is None:
-            all_triangles.append(tri)
             continue
-        (t1, t2), split_line, priority = best
-        split_id = len(triangle_splits) + 1
-        triangle_splits.append({
-            "split_id": split_id,
-            "iteration": iteration,
-            "priority": priority,
-            "parent": tri,
-            "split_line": split_line,
-            "child1": t1,
-            "child2": t2,
-        })
+        (t1, t2), split_line, _priority = best
+        t1, t2 = _order_children_left_right(split_line, t1, t2)
+        line_splits = []
         ce1, ce2 = _assign_edges(
-            (t1, t2), current, split_line, True, split_id, iteration, line_splits
+            (t1, t2), current, split_line, True, len(events) + 1, iteration, line_splits
         )
+        events.append({
+            "id": addr,
+            "child0": addr + "0",
+            "child1": addr + "1",
+            "parent": _tri_xy(tri),
+            "cut": _edge_xy(split_line),
+            "child": (_tri_xy(t1), _tri_xy(t2)),
+            "line_splits": [
+                {
+                    "edge": _edge_xy(rec["original_edge"]),
+                    "point": _xy(rec["split_point"]),
+                    "seg": (_edge_xy(rec["segment1"]), _edge_xy(rec["segment2"])),
+                }
+                for rec in line_splits
+            ],
+        })
         if _area(t1) > AREA_TOL:
-            queue.append((t1, _filter_degenerate(ce1)))
+            queue.append((t1, _filter_degenerate(ce1), addr + "0"))
         if _area(t2) > AREA_TOL:
-            queue.append((t2, _filter_degenerate(ce2)))
+            queue.append((t2, _filter_degenerate(ce2), addr + "1"))
 
-    while queue:
-        tri, _ = queue.popleft()
-        if _area(tri) > AREA_TOL:
-            all_triangles.append(tri)
-
-    leaves = [tri for tri in all_triangles if _area(tri) > AREA_TOL]
-    mark = _mark_triangles(leaves, polygon_edges, ring_xy)
-    walk, walkable = _build_walk(polygon_edges, line_splits)
-
-    def _region_name(code):
-        return {REGION_INSIDE: "INSIDE", REGION_OUTSIDE: "OUTSIDE"}.get(code, "BOUNDARY")
-
-    marks_out = []
-    for i, tri in enumerate(leaves):
-        qv = np.array([_quantize_pt(tri[0]), _quantize_pt(tri[1]), _quantize_pt(tri[2])],
-                      dtype=np.int64)
-        sides = []
-        for skey in mark["leaf_side_keys"][i]:
-            pe_i = mark["poly_edge_by_key"].get(skey)
-            if pe_i is not None:
-                sides.append(_edge_xy(polygon_edges[pe_i]))
-        marks_out.append({
-            "leaf_id": i + 1,
-            "region_code": mark["codes"][i],
-            "region": _region_name(mark["codes"][i]),
-            "vertices": _tri_xy(tri),
-            "area": _area(tri),
-            "quantized": qv,
-            "polygon_sides": sides,
-        })
-
-    splits_out = []
-    for rec in triangle_splits:
-        sl = rec["split_line"]
-        splits_out.append({
-            "split_id": rec["split_id"],
-            "iteration": rec["iteration"],
-            "priority": rec["priority"],
-            "parent": _tri_xy(rec["parent"]),
-            "split_line": _edge_xy(sl),
-            "child1": _tri_xy(rec["child1"]),
-            "child2": _tri_xy(rec["child2"]),
-        })
-
-    lines_out = []
-    for rec in line_splits:
-        qp = _quantize_pt(rec["split_point"])
-        lines_out.append({
-            "split_id": rec["split_id"],
-            "triangle_split_id": rec["triangle_split_id"],
-            "iteration": rec["iteration"],
-            "original_edge": _edge_xy(rec["original_edge"]),
-            "split_point": _xy(rec["split_point"]),
-            "segment1": _edge_xy(rec["segment1"]),
-            "segment2": _edge_xy(rec["segment2"]),
-            "quantized_point": np.array(qp, dtype=np.int64),
-        })
-
-    return {
-        "triangle_splits": splits_out,
-        "line_splits": lines_out,
-        "marks": marks_out,
-        "walk": walk,
-        "stats": {
-            "n_polygon": int(ring_xy.shape[0]),
-            "n_splits": len(splits_out),
-            "n_line_splits": len(lines_out),
-            "n_leaves": len(marks_out),
-            "n_interior": mark["inside_count"],
-            "n_exterior": mark["outside_count"],
-            "perwalk_seeds": mark["perwalk_seeds"],
-            "flood_added": mark["flood_added"],
-            "flood_unreached": mark["flood_unreached"],
-            "inside_area": mark["inside_area"],
-            "polygon_area": mark["polygon_area"],
-            "area_ok": mark["area_ok"],
-            "walkable": bool(walkable),
-        },
-    }
+    return events

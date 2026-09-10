@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+python/tridecomp/__init__.py
+python/tridecomp/_cpp.cpython-311-x86_64-linux-gnu.so
+python/tridecomp/core.py
+python/tridecomp/geom.py
+python/tridecomp/gettri.py
+python/tridecomp/read_tiger.py
+python/tridecomp/walk.py
+python/tridecomp.egg-info/PKG-INFO
+python/tridecomp.egg-info/SOURCES.txt
+python/tridecomp.egg-info/dependency_links.txt
+python/tridecomp.egg-info/top_level.txt
