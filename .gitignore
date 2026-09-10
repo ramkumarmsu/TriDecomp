@@ -13,3 +13,4 @@ triangle_decision_log.txt
 debug_out_lookahead.txt
 *.csv
 python/tridecomp/_cpp*.so
+tl_2025_us_county.zip
